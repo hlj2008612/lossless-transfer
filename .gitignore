@@ -18,6 +18,7 @@ env/
 *.lossless-state.json
 *.tmp
 *.lossless-manifest.json
+.lossless-web/
 
 # Local verification output / received files
 received/

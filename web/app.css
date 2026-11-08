@@ -1,0 +1,83 @@
+:root{
+  --bg:#0e1116; --card:#181d26; --card2:#1f2632; --line:#2b3442;
+  --fg:#e8edf5; --muted:#8b97a8; --accent:#4ade9b; --accent2:#37c2f5;
+  --danger:#ff6b6b; --warn:#f5c451; --ok:#4ade9b;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--fg);
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;
+  padding:24px 18px 40px; max-width:940px; margin:0 auto;
+}
+h1,h2,h3{margin:0}
+h1{font-size:20px; letter-spacing:.3px}
+h1 small{font-size:12px; color:var(--muted); font-weight:400; margin-left:8px}
+h2{font-size:15px; margin-bottom:10px; color:var(--fg)}
+code{background:#0b0e13; padding:1px 5px; border-radius:4px; font-size:12px; color:var(--accent2)}
+.top{display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px}
+.brand{display:flex; align-items:center; gap:14px}
+.brand p{margin:2px 0 0; color:var(--muted); font-size:12px}
+.logo{
+  width:44px;height:44px;border-radius:12px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));
+  color:#06210f;font-size:24px;font-weight:700;
+}
+.badge{font-size:12px;padding:6px 12px;border-radius:999px;white-space:nowrap}
+.badge-off{background:#3a2222;color:#ff9a9a}
+.badge-on{background:#143a2a;color:var(--accent)}
+.card{
+  background:var(--card); border:1px solid var(--line); border-radius:14px;
+  padding:18px; margin-bottom:16px;
+}
+.hint{color:var(--muted); font-size:12px; margin:6px 0 14px}
+.row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+.row.between{justify-content:space-between}
+input[type=password],input[type=text]{
+  flex:1; min-width:220px; background:#0b0e13; border:1px solid var(--line);
+  color:var(--fg); padding:10px 12px; border-radius:9px; font-size:14px; outline:none;
+}
+input[type=password]:focus{border-color:var(--accent2)}
+.btn{
+  background:var(--card2); color:var(--fg); border:1px solid var(--line);
+  padding:9px 15px; border-radius:9px; cursor:pointer; font-size:13px;
+  display:inline-flex; align-items:center; gap:6px;
+}
+.btn:hover{border-color:var(--accent2)}
+.btn.primary{background:var(--accent); color:#06210f; border-color:var(--accent); font-weight:600}
+.btn.ghost{background:transparent}
+.btn.danger{color:#ffb3b3; border-color:#5a2a2a}
+.btn:disabled{opacity:.45; cursor:default}
+.hidden{display:none!important}
+.kv{margin-top:12px; font-size:12px; color:var(--muted); display:grid; gap:2px}
+.kv b{color:var(--fg)}
+.drop{
+  border:2px dashed var(--line); border-radius:12px; padding:24px; text-align:center;
+  background:#12161e; transition:border-color .15s, background .15s;
+}
+.drop.hover{border-color:var(--accent); background:#13241c}
+.drop p{margin:0 0 10px; color:var(--muted)}
+.file-row{
+  background:var(--card2); border:1px solid var(--line); border-radius:10px;
+  padding:12px 14px; margin-top:10px;
+}
+.file-head{display:flex; justify-content:space-between; align-items:center; gap:10px}
+.file-name{font-weight:600; word-break:break-all}
+.file-meta{font-size:12px; color:var(--muted)}
+.file-status{font-size:12px; font-weight:600; white-space:nowrap}
+.st-ok{color:var(--ok)} .st-err{color:var(--danger)} .st-run{color:var(--accent2)} .st-wait{color:var(--warn)}
+.bar{height:8px; background:#0b0e13; border-radius:999px; overflow:hidden; margin-top:9px}
+.bar > i{display:block; height:100%; width:0; background:linear-gradient(90deg,var(--accent2),var(--accent)); transition:width .12s}
+.hash{font:11px/1.5 ui-monospace,Consolas,monospace; color:var(--muted); margin-top:8px; word-break:break-all}
+.list .file-row{margin-top:8px}
+.list-empty{color:var(--muted); font-size:13px; padding:10px 0}
+.log{
+  background:#0b0e13; border:1px solid var(--line); border-radius:10px;
+  padding:12px; height:170px; overflow:auto; font:12px/1.6 ui-monospace,Consolas,monospace;
+  color:#aab6c6;
+}
+.log div{white-space:pre-wrap}
+.log .t{color:#5c6b7e}
+.log .ok{color:var(--ok)} .log .err{color:var(--danger)} .log .warn{color:var(--warn)}
+footer{margin-top:22px; color:var(--muted); font-size:12px; text-align:center}
+footer b{color:var(--accent)}

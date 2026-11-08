@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>无损传输 · 照片 / 视频</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo">⇄</span>
+    <div>
+      <h1>无损传输 <small>lossless-transfer</small></h1>
+      <p>字节级一致 · 不重编码 · SHA-256 双向校验</p>
+    </div>
+  </div>
+  <div id="connBadge" class="badge badge-off">未连接</div>
+</header>
+
+<!-- connection / token -->
+<section class="card" id="connCard">
+  <h2>① 连接</h2>
+  <p class="hint">输入服务端启动时打印的 <b>ACCESS TOKEN</b>（会作为 <code>X-LT-Token</code> 头发送）。跨网络时把浏览器地址换成 SakuraFrp 隧道给出的公网地址即可。</p>
+  <div class="row">
+    <input type="password" id="token" placeholder="ACCESS TOKEN" autocomplete="off" spellcheck="false">
+    <button id="connectBtn" class="btn primary">连接</button>
+  </div>
+  <div id="connInfo" class="kv"></div>
+</section>
+
+<div id="workspace" class="hidden">
+  <!-- upload -->
+  <section class="card">
+    <h2>② 上传照片 / 视频</h2>
+    <div id="drop" class="drop">
+      <p>把文件拖到这里，或</p>
+      <label class="btn">选择文件 <input type="file" id="fileInput" multiple hidden></label>
+      <p class="hint">支持任意格式（.JPG .CR3 .NEF .PNG .MP4 .MOV …），按原始字节传输。</p>
+    </div>
+    <div id="uploadQueue"></div>
+  </section>
+
+  <!-- library -->
+  <section class="card">
+    <div class="row between">
+      <h2>③ 资料库（服务端已收到的文件）</h2>
+      <button id="refreshBtn" class="btn ghost">刷新</button>
+    </div>
+    <div id="fileList" class="list"></div>
+  </section>
+</div>
+
+<section class="card">
+  <h2>运行日志</h2>
+  <div id="logBox" class="log"></div>
+</section>
+
+<footer>
+  <p>纯前端 SHA-256 校验 · 零第三方依赖 · 明文 HTTP（请走可信隧道，勿在公网裸奔）</p>
+  <p>画质说明：文件不解码、不重编码、不缩放、不压缩、不改 EXIF/元数据 —— <b>与原文件字节完全相同</b>。</p>
+</footer>
+
+<script src="/sha256.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
