@@ -88,7 +88,8 @@
 │       └── test_key.pem
 └── scripts/
     ├── verify_transfer.py          # 独立校验脚本：真实 CLI 双进程，出 38/38 报告
-    └── gen_cert.ps1                # 零依赖自签证书生成器（PowerShell 7+ / .NET）
+    ├── gen_cert.ps1                # 零依赖自签证书生成器（PowerShell 7+ / .NET）
+    └── start_web.ps1               # 方案 A 一键启动：缺证书自动生成 + 原生 HTTPS 服务
 ```
 
 关键实现位置（行号随版本可能微调，可用 `--help` 与 `grep` 定位）：
@@ -105,7 +106,7 @@
 | 离线双文件比对 / 生成清单 | `run_verify()` / `run_manifest()` |
 | 网页版 HTTP 服务 / 路由 / 令牌鉴权 | `web_transfer.py` `class Handler` / `Config` |
 | 原生 HTTPS（内地节点跨网必需） | `web_transfer.py` `build_tls_context()` / `main()` 的 `--tls-cert/--tls-key` |
-| 自签证书生成（零依赖） | `scripts/gen_cert.ps1` |
+| 自签证书生成（零依赖） / 方案 A 一键启动 | `scripts/gen_cert.ps1` / `scripts/start_web.ps1` |
 | 网页端分块 + 校验 + 上传 / 下载 | `web/app.js` `buildManifest()` / `uploadFile()` / `downloadFile()` |
 | 浏览器端纯 JS 增量 SHA-256 | `web/sha256.js` `class Sha256` / `sha256Hex()` |
 
@@ -183,18 +184,15 @@ Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一�
 
 **方案 A：让 `web_transfer.py` 自己说 HTTPS（推荐，端到端加密）**
 
-1. 生成一张自签证书（零第三方依赖，PowerShell 7+ 自带 .NET 即可，不需要 openssl）：
-   ```powershell
-   pwsh -NoProfile -File .\scripts\gen_cert.ps1 -OutDir .\tls `
-        -DnsNames localhost,127.0.0.1,你的隧道公网域名 -Days 365 -Force
-   ```
-   `你的隧道公网域名` 填第 3 步面板给出的域名（如 `frp-ski.com`），这样浏览器只会出现一次「证书不受信任」提示，不会再叠加域名不匹配警告。脚本产出 `tls/cert.pem` 与 `tls/key.pem`（含私钥，已被 `.gitignore` 排除，切勿提交）。
-2. 接收端以 HTTPS 启动：
-   ```bash
-   python3 web_transfer.py --host 127.0.0.1 --port 8765 --dir ./received \
-       --token 你自己的口令 --tls-cert ./tls/cert.pem --tls-key ./tls/key.pem
-   ```
-   启动日志会显示 `Local URL: https://127.0.0.1:8765` 与 `TLS: ENABLED`。
+最省事的是**一键脚本**：它会按需生成自签证书、以原生 HTTPS 启动服务，并把 `ACCESS TOKEN` 打印在窗口里。
+
+```powershell
+pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
+```
+（也可先 `pwsh -NoProfile -File .\scripts\gen_cert.ps1 -OutDir .\tls -DnsNames localhost,127.0.0.1,你的隧道公网域名 -Force` 单独生成证书，再用 `py -3 web_transfer.py --tls-cert .\tls\cert.pem --tls-key .\tls\key.pem ...` 手动启动；两者等价。`start_web.ps1` 支持 `-Port` / `-Dir` / `-ChunkSize` / `-DnsNames` / `-RegenerateCert`。）
+
+1. **证书**：脚本缺证书时自动调用 `gen_cert.ps1` 生成 `tls/cert.pem` 与 `tls/key.pem`（含私钥，已被 `.gitignore` 排除，切勿提交）。`-DnsNames` 里带上公网域名（如 `frp-ski.com`），这样浏览器只出现一次「证书不受信任」提示，不会再叠加域名不匹配警告。
+2. 启动日志会显示 `Local URL: https://127.0.0.1:8765` 与 `TLS: ENABLED`，以及 `ACCESS TOKEN`。**保持这个窗口开着**。
 3. 启动器 → **隧道 → 创建隧道**：
    - **选择节点**：在「普通节点(内地)」里挑一个**离双方都近、可用于 TCP 的节点**。带「🚫 UDP」标记的节点照样可用（本项目只用 TCP）；带「建站」标记的通常更合适。
    - **隧道类型**：选 **TCP 隧道**（不是 UDP、不是 HTTP/HTTPS 类型）。
