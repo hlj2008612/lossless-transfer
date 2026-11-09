@@ -8,7 +8,7 @@
 项目提供两种用法，共用同一套哈希 / 清单 / 断点续传逻辑：
 
 - **CLI**：`lossless_transfer.py` —— 命令行 TCP 直传，适合本机 / 局域网、脚本批处理。
-- **网页版**：`web_transfer.py` + `web/` —— 浏览器里拖拽上传、点击下载；配合内网穿透（如 SakuraFrp）可**在不同网络 / 跨公网**使用，另一端只要一个浏览器。
+- **网页版**：`web_transfer.py` + `web/` —— 浏览器里拖拽上传、点击下载；配合内网穿透（如 SakuraFrp）可**在不同网络 / 跨公网**使用，另一端只要一个浏览器。支持**原生 HTTPS**（`--tls-cert/--tls-key`），这也是内地节点跨网访问的必需配置（详见下文）。
 
 ---
 
@@ -55,11 +55,12 @@
 | --- | --- |
 | `http.server.ThreadingHTTPServer` | 标准库自带，纯 Python，无需 Flask/FastAPI/nginx |
 | 纯静态前端（`web/` 三个文件） | 无需构建工具；浏览器原生 `fetch` / `Blob.slice().arrayBuffer()` 即可分块读原始字节 |
-| **自写纯 JS SHA-256** (`web/sha256.js`) | SakuraFrp/frp 的普通 TCP 隧道是明文 HTTP，属于**非安全上下文**，`window.crypto.subtle` 会被浏览器禁用；因此自带增量式 SHA-256，且避免把整个视频读进内存 |
+| **自写纯 JS SHA-256** (`web/sha256.js`) | 普通 TCP 隧道 / 局域网常是明文 HTTP，属于**非安全上下文**，`window.crypto.subtle` 会被浏览器禁用；因此自带增量式 SHA-256，且避免把整个视频读进内存。开启 HTTPS 后浏览器原生 `crypto.subtle` 也可用，但本项目仍统一用自带实现，行为一致 |
 | 令牌鉴权 `X-LT-Token` | 隧道把端口暴露到公网，必须有一道口令（`hmac.compare_digest` 常量时间比对）；比 CLI 的「无认证」更进一步 |
+| **原生 HTTPS**（可选 `--tls-cert/--tls-key`） | 标准库 `ssl.SSLContext` 直接把监听 socket 包成 TLS；内地 SakuraFrp 节点按合规要求拦截明文 HTTP（返回 501），但放行 TLS 字节流，因此跨公网必须让链路是 HTTPS。配套 `scripts/gen_cert.ps1` 零依赖生成自签证书 |
 | 大分块（默认 4 MiB） | 隧道上往返延迟更高，加大块减少请求数 |
 
-**未实现（明确的边界，非缺陷）**：CLI 传输层**无加密、无身份认证**（明文 TCP，仅建议可信局域网 / 本机，公网请套 SSH 隧道、WireGuard 或 TLS 反向代理）。网页版增加了**令牌鉴权**，但仍是**明文 HTTP**——令牌和文件字节都未加密，请务必使用足够随机的口令，并理解隧道服务商理论上能看到流量。协议不含 NAT 穿透（由 frp 等外部工具解决）、不含多文件批量（可逐个选 / 脚本循环）、不含目录递归。
+**未实现（明确的边界，非缺陷）**：CLI 传输层**无加密、无身份认证**（明文 TCP，仅建议可信局域网 / 本机，公网请套 SSH 隧道、WireGuard 或 TLS 反向代理）。网页版增加了**令牌鉴权**；不开 `--tls-cert` 时仍是**明文 HTTP**（仅建议本机 / 可信局域网），开 HTTPS 后令牌与文件字节在链路上加密（自签证书仅提供加密与主机校验，不提供公信力，首次访问浏览器会提示一次）。协议不含 NAT 穿透（由 frp 等外部工具解决）、不含多文件批量（可逐个选 / 脚本循环）、不含目录递归。
 
 ---
 
@@ -79,11 +80,15 @@
 ├── .gitignore
 ├── tests/
 │   ├── test_lossless_transfer.py   # 11 个 unittest：CLI 真实 TCP 端到端
-│   ├── test_web_transfer.py        # 10 个 unittest：网页 HTTP API 端到端
+│   ├── test_web_transfer.py        # 12 个 unittest：网页 HTTP/HTTPS API 端到端
 │   ├── test_sha256_js.js           # 纯 JS SHA-256 对拍 Node crypto（51 cases）
-│   └── test_web_e2e_node.js        # 浏览器真实代码路径 e2e（135 checks）
+│   ├── test_web_e2e_node.js        # 浏览器真实代码路径 e2e（支持 HTTPS 隧道）
+│   └── fixtures/                   # 公开的一次性测试用自签证书（非真实凭据）
+│       ├── test_cert.pem
+│       └── test_key.pem
 └── scripts/
-    └── verify_transfer.py          # 独立校验脚本：真实 CLI 双进程，出 38/38 报告
+    ├── verify_transfer.py          # 独立校验脚本：真实 CLI 双进程，出 38/38 报告
+    └── gen_cert.ps1                # 零依赖自签证书生成器（PowerShell 7+ / .NET）
 ```
 
 关键实现位置（行号随版本可能微调，可用 `--help` 与 `grep` 定位）：
@@ -99,6 +104,8 @@
 | 接收端（收 META→回 RESUME→验块→原子发布→回 DONE） | `run_receiver()` |
 | 离线双文件比对 / 生成清单 | `run_verify()` / `run_manifest()` |
 | 网页版 HTTP 服务 / 路由 / 令牌鉴权 | `web_transfer.py` `class Handler` / `Config` |
+| 原生 HTTPS（内地节点跨网必需） | `web_transfer.py` `build_tls_context()` / `main()` 的 `--tls-cert/--tls-key` |
+| 自签证书生成（零依赖） | `scripts/gen_cert.ps1` |
 | 网页端分块 + 校验 + 上传 / 下载 | `web/app.js` `buildManifest()` / `uploadFile()` / `downloadFile()` |
 | 浏览器端纯 JS 增量 SHA-256 | `web/sha256.js` `class Sha256` / `sha256Hex()` |
 
@@ -141,7 +148,7 @@ Windows 上直接用 `py -3 scripts/verify_transfer.py`（脚本用 `sys.executa
 
 ## 网页版：浏览器上传 / 下载（可在不同网络、跨公网使用）
 
-CLI 适合命令行；如果想**在网页里拖拽上传、点击下载**，或两台机器**不在同一个局域网**（家里 ↔ 公司、手机 ↔ 家里电脑），用网页版。它仍然是**零第三方依赖**：服务端 `web_transfer.py`（Python 标准库 `http.server`），前端是 `web/` 下三个纯静态文件 + 一个纯 JS 实现的 SHA-256。
+CLI 适合命令行；如果想**在网页里拖拽上传、点击下载**，或两台机器**不在同一个局域网**（家里 ↔ 公司、手机 ↔ 家里电脑），用网页版。它仍然是**零第三方依赖**：服务端 `web_transfer.py`（Python 标准库 `http.server`），前端是 `web/` 下四个纯静态文件（含一个纯 JS 实现的 SHA-256）。
 
 ### 本机 / 局域网快速体验
 
@@ -149,14 +156,16 @@ CLI 适合命令行；如果想**在网页里拖拽上传、点击下载**，或
 ```bash
 python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./received --token 你自己的口令
 ```
-Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一个**并打印在启动日志里。启动后终端会打印类似：
+Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一个**并打印在启动日志里。加 `--tls-cert`/`--tls-key` 则改为原生 HTTPS（跨公网 / 内地节点必需，见下一节）。启动后终端会打印类似：
 
 ```
-Library : D:\...\无损传输\received
-Chunk   : 4194304 bytes
-Local   : http://127.0.0.1:8765
-ACCESS TOKEN: xxxxxxxxxxxxxxxxxxxxxx
-WARNING: plain HTTP; token and file bytes are NOT encrypted
+  lossless-transfer  WEB  v1.1.0   (Python stdlib only)
+  Library dir  : D:\...\无损传输\received
+  Chunk size   : 4194304 bytes (4.0 MiB)
+  Local URL    : http://127.0.0.1:8765     # 加了证书则是 https://
+  ACCESS TOKEN : xxxxxxxxxxxxxxxxxxxxxx
+  WARNING: plain HTTP; token and file bytes are NOT encrypted   # 明文模式才有
+======================================================================
 ```
 
 **发送端（任何有浏览器的设备）**：打开 `http://<接收端IP>:8765` → 在「连接」卡片填入上面的 `ACCESS TOKEN` → 点「连接」。之后：
@@ -168,30 +177,52 @@ WARNING: plain HTTP; token and file bytes are NOT encrypted
 
 ### 跨网络 / 不同局域网：用 SakuraFrp（或任意 frp）TCP 隧道
 
-网页版本质是一个 HTTP 服务，只要让「另一端」能访问到这个端口即可。两台机器不在同一网络时，用内网穿透把接收端的 `127.0.0.1:8765` 映射成一个公网地址。以 **SakuraFrp 启动器**（截图版本 `3.2.0.2 / 3.1.9 / 0.51.0-sakura-15.1`）为例：
+网页版本质是一个 HTTP(S) 服务，只要让「另一端」能访问到这个端口即可。两台机器不在同一网络时，用内网穿透把接收端的 `127.0.0.1:8765` 映射成一个公网地址。以 **SakuraFrp 启动器**（截图版本 `3.2.0.2 / 3.1.9 / 0.51.0-sakura-15.1`）为例。
 
-1. 接收端保持 `web_transfer.py` 运行（本机监听 `127.0.0.1:8765` 即可，隧道会连过来）。
-2. 启动器 → **隧道 → 创建隧道**：
-   - **选择节点**：在「普通节点(内地)」里挑一个**离双方都近、可用于 TCP 的节点**。注意节点卡片上的「🚫 UDP」标记——本项目**只用 TCP**，所以带「禁止 UDP」标记的节点照样可用；避开只做「公开游戏 / UDP」用途的节点即可。带「建站」标记的节点通常更合适。
+> ⚠️ **内地节点必须走 HTTPS**：SakuraFrp 的「普通节点(内地)」（含实测的 `#62 东莞双线PLUS2`）按机房合规要求**拦截明文 HTTP 的 TCP 隧道**——浏览器用 `http://` 访问会收到节点返回的 `501 Not Implemented` 页面（正文写明「请启用 HTTPS 后使用 HTTPS 访问」），无论本地服务是否正常。TLS 字节流则原样放行。据 [官方文档](https://doc.natfrp.com/faq/site-inaccessible.html)：内地节点「TCP 隧道映射 HTTP 流量 = ✗（请配置自动 HTTPS）」「TCP 隧道映射 HTTPS 流量 = ✓」。所以跨公网前先选下面 **A / B 任一方案**让链路是 HTTPS。
+
+**方案 A：让 `web_transfer.py` 自己说 HTTPS（推荐，端到端加密）**
+
+1. 生成一张自签证书（零第三方依赖，PowerShell 7+ 自带 .NET 即可，不需要 openssl）：
+   ```powershell
+   pwsh -NoProfile -File .\scripts\gen_cert.ps1 -OutDir .\tls `
+        -DnsNames localhost,127.0.0.1,你的隧道公网域名 -Days 365 -Force
+   ```
+   `你的隧道公网域名` 填第 3 步面板给出的域名（如 `frp-ski.com`），这样浏览器只会出现一次「证书不受信任」提示，不会再叠加域名不匹配警告。脚本产出 `tls/cert.pem` 与 `tls/key.pem`（含私钥，已被 `.gitignore` 排除，切勿提交）。
+2. 接收端以 HTTPS 启动：
+   ```bash
+   python3 web_transfer.py --host 127.0.0.1 --port 8765 --dir ./received \
+       --token 你自己的口令 --tls-cert ./tls/cert.pem --tls-key ./tls/key.pem
+   ```
+   启动日志会显示 `Local URL: https://127.0.0.1:8765` 与 `TLS: ENABLED`。
+3. 启动器 → **隧道 → 创建隧道**：
+   - **选择节点**：在「普通节点(内地)」里挑一个**离双方都近、可用于 TCP 的节点**。带「🚫 UDP」标记的节点照样可用（本项目只用 TCP）；带「建站」标记的通常更合适。
    - **隧道类型**：选 **TCP 隧道**（不是 UDP、不是 HTTP/HTTPS 类型）。
-   - **本地地址** `127.0.0.1`，**本地端口** `8765`；**远程端口**按面板分配（或自选可用端口）。
-3. 创建后启动该隧道，面板会给出类似 `frp-xxx.example.com:12345` 或 `节点IP:远程端口` 的**公网地址**。
-4. 另一端（任何网络）浏览器打开 `http://<公网地址>`（上面分配的域名 + 远程端口），填入 `ACCESS TOKEN` 即可上传 / 下载，体验和局域网内完全一样。
+   - **自动 HTTPS**：保持 **禁用**（TLS 已由本地服务提供，别让 frpc 再脱壳一次）。
+   - **本地地址** `127.0.0.1`，**本地端口** `8765`；**远程端口**按面板分配。
+4. 创建后启动该隧道，面板给出公网地址（如 `frp-ski.com:18482`）。另一端（任何网络）浏览器打开 **`https://<公网地址>`**，首次会提示「您的连接不是私密连接」→ 高级 → 继续（自签证书，仅此一次），填入 `ACCESS TOKEN` 即可上传 / 下载。
 
-> 也可用 `ssh -R`、其它 frp 服务商、Cloudflare Tunnel、WireGuard / Tailscale 等任意「把本地 TCP 端口暴露出去」的方案，步骤同理：隧道只在传输层转发 TCP 字节，不解析、不改写文件内容。
+**方案 B：用启动器的「自动 HTTPS」（本地服务保持明文）**
 
-> 想验证一条真实隧道是否真的无损，可用浏览器代码路径的 e2e 测试指向它：
+1. 创建/编辑同一条 TCP 隧道，把 **自动 HTTPS** 从「禁用」改为 **启用 / 自动**，重启 frpc。据 [自动 HTTPS 文档](https://doc.natfrp.com/frpc/auto-https.html)，frpc 会在公网侧用 TLS 接受连接、脱壳后以**明文 HTTP** 转发给本地 `web_transfer.py`（本地仍用不带证书的命令启动）。
+2. 面板的「连接方式」会变成 `https://...`，浏览器用 **`https://<公网地址>`** 访问（同样有自签证书首次提示）。
+3. 注意：此方案里「公网 → frpc」加密、「frpc → 本地」是明文，但同一台机器上一般可接受；方案 A 则是全程 TLS 到应用。
+
+> 也可用 `ssh -R`、其它 frp 服务商、Cloudflare Tunnel、WireGuard / Tailscale 等任意「把本地 TCP 端口暴露出去」的方案，步骤同理。所有隧道 / TLS 都只在传输层转发字节，不解析、不改写文件内容，因此对画质无影响。
+
+> 想验证一条真实隧道是否真的无损，可用浏览器代码路径的 e2e 测试指向它（HTTPS + 自签证书时把证书加入信任）：
 > ```bash
-> LT_E2E_URL=http://<公网地址> LT_E2E_TOKEN=<口令> node tests/test_web_e2e_node.js
+> LT_E2E_URL=https://<公网地址> LT_E2E_TOKEN=<口令> \
+>   NODE_EXTRA_CA_CERTS=./tls/cert.pem node tests/test_web_e2e_node.js
 > ```
-> 它会用前端同款 `web/sha256.js` 造清单并跑完整上传 / 下载 / 篡改检测。
+> 它会用前端同款 `web/sha256.js` 造清单并跑完整上传 / 下载 / 篡改检测；服务端 `tls:true` 也会被断言。
 
 ### 画质会有影响吗？——不会，一点都不会
 
 这是本项目最核心的保证，网页版与 CLI 完全一致：
 
 - **不解码、不重编码、不缩放、不重新压缩、不改容器、不改 EXIF / 元数据**：照片和视频从头到尾被当作**不透明字节流**（上传 `File.slice()` / `Uint8Array`，下载 `Blob`），代码里没有任何 `Pillow` / `ffmpeg` / `<canvas>` / 图像视频库调用。
-- **隧道只转发 TCP 字节**：SakuraFrp / frp 在传输层复制字节流，不解析、不改写 HTTP 载荷里的文件内容，因此对画质**零影响**。
+- **隧道只在传输层转发字节**：SakuraFrp / frp 把 TCP 字节流（启用 HTTPS 后是不透明的 TLS 记录）原样复制到接收端，不解析、不改写文件内容；TLS 只是给这条字节流加密，同样不接触明文载荷，因此对画质**零影响**。实测：明文 HTTP 经内地节点会被 501 拦截，换成 HTTPS 后同一条隧道完整跑通「上传 → 逐块校验 → 整文件校验 → 下载重组」，字节与源文件完全一致。
 - **三层 SHA-256 证明一致**：
   1. 浏览器端（上传前）逐块 + 整文件各算一次；
   2. 服务端收到每块**独立复算**，不符直接 `422 wire corruption`，坏字节不落盘；
@@ -208,7 +239,7 @@ WARNING: plain HTTP; token and file bytes are NOT encrypted
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/info` | 服务信息、`chunk_size`、`token_required` |
+| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`、`tls` |
 | GET | `/api/list` | 列出资料库文件（name / size / mtime_ns） |
 | POST | `/api/upload/init` | 提交清单；返回 `status=upload` + `next_index`（或 `complete` 幂等跳过） |
 | POST | `/api/upload/chunk?name=&index=` | 上传一块原始字节，服务端逐块校验 SHA-256 |
@@ -220,12 +251,12 @@ WARNING: plain HTTP; token and file bytes are NOT encrypted
 ### 网页版测试
 
 ```bash
-python3 -m unittest discover -s tests -v      # 21 个测试（11 CLI + 10 网页 API）
+python3 -m unittest discover -s tests -v      # 23 个测试（11 CLI + 12 网页 HTTP/HTTPS API）
 node tests/test_sha256_js.js                   # 纯 JS SHA-256 对拍 Node crypto：51 cases
-node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e：135 checks
+node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e：约 135 checks（随分块数/幂等跳过浮动）
 ```
 
-`test_web_e2e_node.js` 用**实际的 `web/sha256.js`** 造清单、用 `fetch` + `Uint8Array` 发块（与 `app.js` 一致），起一个真实 `web_transfer.py`，证明「服务端独立 SHA-256 == 浏览器 JS SHA-256（byte-exact, lossless）」、下载重组字节一致、篡改块被拒；全程纯 HTTP、不依赖 `crypto.subtle`。不设环境变量时它会自己拉起服务端；设 `LT_E2E_URL` / `LT_E2E_TOKEN` 则可指向一个已运行的真实隧道。
+`test_web_e2e_node.js` 用**实际的 `web/sha256.js`** 造清单、用 `fetch` + `Uint8Array` 发块（与 `app.js` 一致），起一个真实 `web_transfer.py`，证明「服务端独立 SHA-256 == 浏览器 JS SHA-256（byte-exact, lossless）」、下载重组字节一致、篡改块被拒；不依赖 `crypto.subtle`。不设环境变量时它会自己拉起服务端（明文 HTTP）；设 `LT_E2E_URL` / `LT_E2E_TOKEN` 可指向一个已运行的真实隧道，URL 为 `https://` 时还会断言服务端 `tls:true`（配合 `NODE_EXTRA_CA_CERTS` 信任自签证书）。Python 套件里的 `WebTransferTLS` 会再起一个**原生 HTTPS 服务**，用公开的测试证书跑完整分块上传 / 下载 / 字节比对。`test_web_transfer.py` 中另有 `build_tls_context()` 对缺失证书 / 不成对参数的拒绝测试。
 
 ---
 
@@ -281,8 +312,10 @@ node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e
 ## 安全提示与后续可选项
 
 - ⚠️ **CLI：明文 TCP，无认证**：任何能连上该端口的人都可以推送文件（接收端用 `os.path.basename` 阻断路径穿越，但不验证对端身份）。仅在可信网络使用，或套 SSH：`ssh -L 8765:127.0.0.1:8765 user@receiver`。
-- ⚠️ **网页版：令牌鉴权，但仍是明文 HTTP**：所有 `/api/*` 校验 `X-LT-Token`（`hmac.compare_digest` 常量时间比对），静态页公开、文件名做 `basename` 白名单校验（拒绝空名 / NUL / 斜杠 / 路径穿越 / 内部保留后缀）。但**令牌与文件字节都未加密**：请务必用足够随机的口令（不传 `--token` 即自动生成），不要复用弱口令，并理解隧道服务商 / 同一网络内的监听者理论上能看到流量。需要真正的机密性请再加 HTTPS 反向代理或 WireGuard / Tailscale。
-- 可选增强（超出最小项目范围）：TLS / PSK 认证、目录批量与 manifest 批量校验、并行块、接收端允许列表、端到端加密（在客户端先加密再传，但那样就不是「原样字节」了）。
+- ⚠️ **网页版：令牌鉴权 + 可选原生 HTTPS**：所有 `/api/*` 校验 `X-LT-Token`（`hmac.compare_digest` 常量时间比对），静态页公开、文件名做 `basename` 白名单校验（拒绝空名 / NUL / 斜杠 / 路径穿越 / 内部保留后缀）。
+  - **明文模式**（默认，不带证书）：令牌与文件字节都未加密，仅限本机 / 可信局域网；且经内地 SakuraFrp 节点会被 501 拦截，必须改用 HTTPS。请务必用足够随机的口令（不传 `--token` 即自动生成），不要复用弱口令。
+  - **HTTPS 模式**（`--tls-cert/--tls-key` 或启动器「自动 HTTPS」）：链路上令牌与字节均被 TLS 加密，也是跨公网 / 内地节点的必需配置。自签证书仅提供加密与主机校验、不提供公信力（首次访问会提示一次）；要消除提示可换自有域名证书。文件字节仍不解码、不重编码，画质与「无损」保证不变。
+- 可选增强（超出最小项目范围）：PSK 双向认证、目录批量与 manifest 批量校验、并行块、接收端允许列表、端到端加密（在客户端先加密再传，但那样就不是「原样字节」了）。
 
 ## 许可证
 

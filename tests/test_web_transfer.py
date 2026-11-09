@@ -15,7 +15,10 @@ Covered:
   * crash/resume: re-init returns next_index and the transfer completes;
   * download manifest + chunks reassemble to the identical bytes;
   * empty file, path-traversal rejection, reserved-suffix rejection, delete;
-  * mtime_ns sent as a BigInt *string* is actually restored.
+  * mtime_ns sent as a BigInt *string* is actually restored;
+  * native TLS (--tls-cert/--tls-key) serves HTTPS and still transfers
+    byte-exactly (the mode mainland SakuraFrp nodes require);
+  * build_tls_context() rejects a missing cert/key and a mismatched pair.
 
 Run:  python -m unittest discover -s tests -v
 """
@@ -27,6 +30,7 @@ import importlib.util
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import threading
@@ -357,6 +361,105 @@ class WebTransferE2E(unittest.TestCase):
         st, _, b = self.req("GET", "/api/list")
         self.assertNotIn("empty.bin",
                          [f["name"] for f in json.loads(b)["files"]])
+
+
+class WebTransferTLS(unittest.TestCase):
+    """Native HTTPS server (the mode mainland SakuraFrp nodes require).
+
+    Uses a deliberately-public throwaway key in tests/fixtures; it is NOT a
+    secret and must never be used for anything real.
+    """
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.mkdtemp(prefix="lt-web-tls-test-")
+        cls.lib = os.path.join(cls.tmp, "received")
+        cls.cfg = wt.Config("127.0.0.1", 0, cls.lib, CHUNK_SIZE, TOKEN)
+        cls.cfg.ensure_dirs()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), wt.Handler)
+        cls.httpd.daemon_threads = True
+        cls.httpd.cfg = cls.cfg
+        fixtures = os.path.join(HERE, "fixtures")
+        ctx = wt.build_tls_context(os.path.join(fixtures, "test_cert.pem"),
+                                   os.path.join(fixtures, "test_key.pem"))
+        cls.httpd.socket = ctx.wrap_socket(cls.httpd.socket, server_side=True)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=5)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def tls_req(self, method, path, body=None, headers=None):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # self-signed throwaway fixture
+        conn = http.client.HTTPSConnection("127.0.0.1", self.port,
+                                          timeout=15, context=ctx)
+        h = {"X-LT-Token": TOKEN}
+        if headers:
+            h.update(headers)
+        conn.request(method, path, body=body, headers=h)
+        resp = conn.getresponse()
+        data, status = resp.read(), resp.status
+        conn.close()
+        return status, data
+
+    def test_10_tls_info_and_full_upload_byte_exact(self):
+        st, b = self.tls_req("GET", "/api/info")
+        info = json.loads(b.decode("utf-8"))
+        self.assertEqual(st, 200)
+        self.assertTrue(info["tls"], "server must report native TLS")
+        data = sample_bytes(1000, 31)
+        m = browser_manifest("TLS_VIDEO.MP4", data)
+        st, b = self.tls_req("POST", "/api/upload/init",
+                             json.dumps(m).encode("utf-8"),
+                             {"Content-Type": "application/json"})
+        init = json.loads(b.decode("utf-8"))
+        self.assertEqual(init["status"], "upload")
+        for c in m["chunks"]:
+            st, b = self.tls_req(
+                "POST",
+                "/api/upload/chunk?name=TLS_VIDEO.MP4&index=%d" % c["index"],
+                data[c["offset"]:c["offset"] + c["length"]],
+                {"Content-Type": "application/octet-stream"})
+            self.assertEqual(st, 200, "chunk %d: %r" % (c["index"], b[:200]))
+        st, b = self.tls_req("POST", "/api/upload/complete",
+                             json.dumps({"name": "TLS_VIDEO.MP4",
+                                         "mtime_ns": m["mtime_ns"]}).encode("utf-8"),
+                             {"Content-Type": "application/json"})
+        done = json.loads(b.decode("utf-8"))
+        self.assertEqual(done["status"], "verified")
+        self.assertEqual(done["sha256"], m["sha256"])
+        with open(os.path.join(self.lib, "TLS_VIDEO.MP4"), "rb") as f:
+            self.assertEqual(f.read(), data,
+                             "bytes over HTTPS must be byte-exact")
+        # A plain HTTP request to a TLS-only socket must fail.
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            conn.request("GET", "/api/info", headers={"X-LT-Token": TOKEN})
+            conn.getresponse()
+            self.fail("plain HTTP should not succeed against a TLS socket")
+        except (http.client.BadStatusLine, OSError, ssl.SSLError):
+            pass
+        finally:
+            conn.close()
+
+    def test_11_build_tls_context_rejects_bad_input(self):
+        fixtures = os.path.join(HERE, "fixtures")
+        cert = os.path.join(fixtures, "test_cert.pem")
+        key = os.path.join(fixtures, "test_key.pem")
+        with self.assertRaises(ValueError):
+            wt.build_tls_context("", key)
+        with self.assertRaises(ValueError):
+            wt.build_tls_context(cert, os.path.join(fixtures, "missing.pem"))
+        # A valid pair builds a real server-side context.
+        ctx = wt.build_tls_context(cert, key)
+        self.assertIsInstance(ctx, ssl.SSLContext)
 
 
 if __name__ == "__main__":

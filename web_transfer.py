@@ -16,9 +16,17 @@ Only when all three agree is the transfer declared VERIFIED. The image/video
 bytes are never decoded, re-encoded, resized or stripped of metadata.
 
 Designed to be reachable from another network through a SakuraFrp / frp TCP
-tunnel. Because such a tunnel normally serves plain HTTP, crypto.subtle is
-unavailable in the browser; web/sha256.js is a dependency-free SHA-256 that
-works in any context. All API calls require an X-LT-Token header.
+tunnel. Because a plain TCP tunnel normally serves plain HTTP (a non-secure
+context), crypto.subtle is unavailable in the browser; web/sha256.js is a
+dependency-free SHA-256 that works in any context. All API calls require an
+X-LT-Token header.
+
+Mainland-China SakuraFrp nodes block plain HTTP over a TCP tunnel (they return
+a 501 compliance page) but pass TLS bytes through unmodified. Passing
+--tls-cert/--tls-key makes this server speak HTTPS itself, so the tunnel only
+forwards an opaque TLS stream and the browser uses https:// - no 501, and the
+token/file bytes are encrypted end-to-end. (Equivalently, the launcher's
+"Auto HTTPS" can terminate TLS in front of a plain-HTTP local server.)
 """
 from __future__ import annotations
 
@@ -28,6 +36,7 @@ import hmac
 import json
 import os
 import secrets
+import ssl
 import sys
 import threading
 import traceback
@@ -37,7 +46,7 @@ from typing import Any, Dict, Optional
 
 import lossless_transfer as lt
 
-WEB_VERSION = "1.0.0"
+WEB_VERSION = "1.1.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
 MAX_INIT_BODY = 64 << 20
@@ -270,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
             "protocol": lt.PROTOCOL_VERSION,
             "chunk_size": self.cfg.chunk_size,
             "token_required": True,
+            "tls": isinstance(self.server.socket, ssl.SSLSocket),
         })
 
     def _api_list(self) -> None:
@@ -495,7 +505,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
     p.add_argument("--token", default=None,
                    help="access token; a random one is generated if omitted")
+    p.add_argument("--tls-cert", default=None,
+                   help="PEM certificate to serve HTTPS (needed for mainland "
+                        "SakuraFrp nodes that block plain HTTP); use with --tls-key")
+    p.add_argument("--tls-key", default=None,
+                   help="PEM private key matching --tls-cert")
     return p
+
+
+def build_tls_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+    """Server-side TLS context; fails early with a clear message."""
+    if not cert_path or not key_path:
+        raise ValueError("--tls-cert and --tls-key must be given together")
+    for label, p in (("certificate", cert_path), ("private key", key_path)):
+        if not os.path.isfile(p):
+            raise ValueError("TLS %s not found: %s" % (label, p))
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    return ctx
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -503,12 +530,27 @@ def main(argv: Optional[list] = None) -> int:
     if args.chunk_size <= 0:
         print("ERROR: --chunk-size must be > 0", file=sys.stderr)
         return 2
+    if bool(args.tls_cert) != bool(args.tls_key):
+        print("ERROR: --tls-cert and --tls-key must be used together",
+              file=sys.stderr)
+        return 2
     token = args.token or secrets.token_urlsafe(18)
     cfg = Config(args.host, args.port, args.dir, args.chunk_size, token)
     cfg.ensure_dirs()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     httpd.cfg = cfg  # type: ignore[attr-defined]
+    tls = False
+    if args.tls_cert:
+        try:
+            ctx = build_tls_context(args.tls_cert, args.tls_key)
+        except (ValueError, ssl.SSLError, OSError) as exc:
+            httpd.server_close()
+            print("ERROR: cannot enable TLS: %s" % exc, file=sys.stderr)
+            return 2
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        tls = True
+    scheme = "https" if tls else "http"
     shown_host = "127.0.0.1" if args.host in ("0.0.0.0", "", "::") else args.host
     print("=" * 70)
     print("  lossless-transfer  WEB  v%s   (Python stdlib only)" % WEB_VERSION)
@@ -516,14 +558,26 @@ def main(argv: Optional[list] = None) -> int:
     print("  Library dir  : %s" % cfg.dir)
     print("  Chunk size   : %d bytes (%.1f MiB)" %
           (cfg.chunk_size, cfg.chunk_size / 1048576.0))
-    print("  Local URL    : http://%s:%d" % (shown_host, args.port))
+    print("  Local URL    : %s://%s:%d" % (scheme, shown_host, args.port))
     print("  ACCESS TOKEN : %s" % token)
     print("  -> enter this token in the web page (sent as X-LT-Token header)")
     print("  -> other networks: point a SakuraFrp/frp TCP tunnel at port %d,"
           % args.port)
-    print("     then open the public http://<tunnel-host>:<port> in a browser")
-    print("  WARNING: plain HTTP; token and file bytes are NOT encrypted.")
-    print("           Use a trusted path, or put TLS in front of the tunnel.")
+    print("     then open the public %s://<tunnel-host>:<port> in a browser"
+          % scheme)
+    if tls:
+        print("  TLS          : ENABLED (native HTTPS; tunnel forwards opaque "
+              "TLS bytes)")
+        print("  -> mainland SakuraFrp nodes block plain HTTP (501); with TLS "
+              "they work.")
+        print("  -> self-signed cert: the browser will ask you to accept it "
+              "once.")
+    else:
+        print("  WARNING: plain HTTP; token and file bytes are NOT encrypted.")
+        print("           On mainland SakuraFrp nodes this is blocked with a "
+              "501 page;")
+        print("           add --tls-cert/--tls-key or enable the launcher's "
+              "'Auto HTTPS'.")
     print("=" * 70, flush=True)
     try:
         httpd.serve_forever()

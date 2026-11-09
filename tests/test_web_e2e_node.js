@@ -10,15 +10,21 @@
  *     server's independently computed SHA-256 (byte-exact / lossless);
  *   - download manifest + chunks reassemble to identical bytes under JS
  *     SHA-256 verification;
- *   - this works over plain HTTP (no crypto.subtle, no HTTPS), which is the
- *     SakuraFrp/frp tunnel scenario.
+ *   - it works over BOTH plain HTTP (default, self-spawned) and native HTTPS
+ *     (when pointed at an https:// server), which covers mainland SakuraFrp
+ *     nodes that block plain HTTP (501) but pass TLS bytes through unchanged.
+ *     A TLS-only listener rejecting plaintext HTTP is covered separately by
+ *     the Python suite's WebTransferTLS.test_10.
  *
  * Run:  node tests/test_web_e2e_node.js
- *   or: py -3 -m unittest ... (this file is standalone, not a unittest)
+ *   or: LT_E2E_URL=https://host:port LT_E2E_TOKEN=... \
+ *           NODE_EXTRA_CA_CERTS=/path/cert.pem node tests/test_web_e2e_node.js
  *
- * By default it spawns web_transfer.py itself. Set LT_E2E_URL and
- * LT_E2E_TOKEN to test an already-running server instead (e.g. a real
- * SakuraFrp tunnel), in which case no child process is started.
+ * By default it spawns web_transfer.py itself (plain HTTP). Set LT_E2E_URL
+ * and LT_E2E_TOKEN to test an already-running server instead (e.g. a real
+ * SakuraFrp tunnel), in which case no child process is started. When the URL
+ * is https://, the server must present a certificate Node trusts; exporting
+ * NODE_EXTRA_CA_CERTS to your cert.pem (as gen_cert.ps1 emits) is enough.
  */
 'use strict';
 
@@ -201,6 +207,12 @@ async function waitReady(url, child, timeoutMs) {
       ok(done.size === data.length, 'server size == source size');
     }
 
+    // When testing a TLS server, prove the endpoint really is HTTPS: this is
+    // the mode that mainland SakuraFrp nodes allow (plain HTTP gets a 501).
+    if (url.startsWith('https://')) {
+      ok(info.tls === true, 'server reports native TLS (tls=true) over https');
+    }
+
     // ---- download: manifest + chunks, verified in JS, reassembled ----
     const dm = (await api(url, '/api/download/manifest?name=' +
                           encodeURIComponent(name))).body;
@@ -227,6 +239,10 @@ async function waitReady(url, child, timeoutMs) {
     ok(Number.isFinite(entry.mtime_ns) || typeof entry.mtime_ns === 'number',
        '/api/list returns mtime_ns');
 
+    // A TLS-only listener rejecting plaintext HTTP is covered by the Python
+    // suite (WebTransferTLS.test_10). Here we only assert the browser-path
+    // flows; the external https:// case is verified by `info.tls === true`
+    // above plus the full upload/download round-trip below.
     // ---- wire-corruption detection with JS-computed hashes ----
     const badBytes = new Uint8Array(data.subarray(0, m.chunks[0].length));
     badBytes[0] ^= 0xff;

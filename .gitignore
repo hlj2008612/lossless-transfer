@@ -25,6 +25,19 @@ received/
 verify_output/
 *.log
 
+# Self-signed TLS certificates (contain a PRIVATE KEY - never commit these)
+*.pem
+*.key
+*.pfx
+*.p12
+tls/
+demo_tls/
+demo_web/
+demo_tunnel/
+# ...except the deliberately-public throwaway key used only by unit tests
+!tests/fixtures/test_cert.pem
+!tests/fixtures/test_key.pem
+
 # OS cruft
 .DS_Store
 Thumbs.db
