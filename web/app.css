@@ -226,6 +226,20 @@ input[type=password]:focus, input[type=text]:focus{
   transition:opacity .25s, filter .25s, transform .25s;
 }
 .thumb-loaded .card-thumb{opacity:1}
+/* The camera's EXIF thumbnail is a bare JPEG with no orientation tag of its
+   own, so the grid applies the main file's EXIF 0x0112 itself. The card is a
+   fixed 4:3 box, which is why a 90/270 turn needs the 4/3 scale to cover it
+   again (5/7 are the rare transposed variants). */
+.card-item[data-orient="2"] .card-thumb{transform:scaleX(-1)}
+.card-item[data-orient="3"] .card-thumb{transform:rotate(180deg)}
+.card-item[data-orient="4"] .card-thumb{transform:scaleY(-1)}
+.card-item[data-orient="5"] .card-thumb{transform:rotate(90deg) scaleY(-1) scale(1.3334)}
+.card-item[data-orient="6"] .card-thumb{transform:rotate(90deg) scale(1.3334)}
+.card-item[data-orient="7"] .card-thumb{transform:rotate(270deg) scaleY(-1) scale(1.3334)}
+.card-item[data-orient="8"] .card-thumb{transform:rotate(270deg) scale(1.3334)}
+/* the placeholder (a pulsing "照片" tile) sits above the not-yet-decoded <img>
+   and fades out as the picture fades in */
+.thumb-loaded .card-ph{opacity:0; transition:opacity .25s}
 .thumb-loaded.is-partial .card-thumb{filter:blur(14px) saturate(.8); transform:scale(1.06)}
 .card-item.thumb-unsupported .card-fig{background:repeating-linear-gradient(135deg,var(--surface-2) 0 10px,var(--surface) 10px 20px)}
 .card-item.is-loading .card-ph{animation:ph-pulse 1.4s ease-in-out infinite}
@@ -349,6 +363,18 @@ body.lb-open{overflow:hidden}
   min-width:120px; min-height:80px;
   background:rgba(255,255,255,.04); border-radius:8px;
 }
+/* while the full-resolution bytes stream in, the small thumbnail already
+   decoded by the grid is blown up and blurred (the classic "preview first"
+   look) instead of leaving an empty stage */
+.lb-img.lb-blur{
+  width:min(86vw, 1100px); height:auto; max-height:calc(100vh - 180px);
+  min-width:0; min-height:0; object-fit:cover;
+  filter:blur(26px) saturate(.9); opacity:.75; box-shadow:none;
+}
+/* the blurred placeholder is only used for orientations that need no relayout */
+.lb-img[data-orient="2"]{transform:scaleX(-1)}
+.lb-img[data-orient="3"]{transform:rotate(180deg)}
+.lb-img[data-orient="4"]{transform:scaleY(-1)}
 @keyframes lb-spin{to{transform:rotate(360deg)}}
 .lb-pick{color:#fff; margin-right:2px}
 .lb-nav{

@@ -50,3 +50,6 @@ desktop.ini
 .idea/
 .vscode/
 *.swp
+
+# Local assistant/session notes kept next to the code (machine-specific paths)
+.workbuddy/

@@ -15,6 +15,13 @@ web path provides exactly the same byte-exact guarantee as the CLI:
 Only when all three agree is the transfer declared VERIFIED. The image/video
 bytes are never decoded, re-encoded, resized or stripped of metadata.
 
+Preview is display-only and never touches the verified path:
+  * /api/preview streams the stored bytes verbatim (Range-aware), so images
+    render and videos play/seek without any re-encode;
+  * /api/thumb returns the thumbnail the camera itself embedded in the JPEG's
+    EXIF block - a byte slice of the stored file, never a generated image - so
+    a grid of 10 MB photos costs a few KB per card over a slow tunnel.
+
 Designed to be reachable from another network through a SakuraFrp / frp TCP
 tunnel. Because a plain TCP tunnel normally serves plain HTTP (a non-secure
 context), crypto.subtle is unavailable in the browser; web/sha256.js is a
@@ -36,6 +43,7 @@ import hmac
 import json
 import os
 import secrets
+import struct
 import ssl
 import sys
 import threading
@@ -47,13 +55,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import lossless_transfer as lt
 
-WEB_VERSION = "1.2.0"
+WEB_VERSION = "1.3.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
 MAX_INIT_BODY = 64 << 20
 MAX_SMALL_BODY = 1 << 20
 PREVIEW_CHUNK = 1 << 20             # rolling read size for streamed responses
 PREVIEW_BATCH = 2 << 20             # a small mid-file Range is served in one piece
+# /api/thumb hands the browser the thumbnail the camera itself embedded in the
+# EXIF block - a byte slice of the stored file, never a generated image. It is
+# read from (and kept in) the file's own header region only.
+THUMB_SCAN = 2 << 20                # metadata never lives past this much header
+THUMB_MAX_BYTES = 1 << 20           # ignore an absurd "thumbnail" pointer
+JPEG_EXTS = (".jpg", ".jpeg", ".jpe", ".jfif")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 STATIC_TYPES = {
     "index.html": "text/html; charset=utf-8",
@@ -154,6 +168,107 @@ def media_type(name: str) -> Tuple[str, Optional[str]]:
     return "other", None
 
 
+def _tiff_thumbnail(tiff: bytes) -> Tuple[Optional[bytes], int]:
+    """Return (IFD1 thumbnail bytes, EXIF orientation) of a TIFF/EXIF block.
+
+    Handles both byte orders (II/MM). The thumbnail is located through tags
+    0x0201 (JPEGInterchangeFormat, an offset) and 0x0202 (its length); the
+    orientation comes from IFD0 tag 0x0112. Every read is bounds-checked, so a
+    truncated or hostile EXIF block simply yields (None, 1) instead of raising.
+
+    The orientation matters because the thumbnail is a *bare* JPEG with no EXIF
+    of its own: a photo stored sideways (Orientation 6/8) would otherwise show
+    up rotated in the grid while the full image - which the browser orients
+    from the main file's tag - displays correctly.
+    """
+    if len(tiff) < 8:
+        return None, 1
+    if tiff[:2] == b"II":
+        e = "<"
+    elif tiff[:2] == b"MM":
+        e = ">"
+    else:
+        return None, 1
+    if struct.unpack(e + "H", tiff[2:4])[0] != 42:
+        return None, 1
+    off = struct.unpack(e + "I", tiff[4:8])[0]
+    orientation = 1
+    # IFD0 carries the real tags, IFD1 the embedded thumbnail; walk the chain
+    # (bounded, because the next-IFD pointers are attacker-controlled).
+    for hop in range(4):
+        if off < 8 or off + 2 > len(tiff):
+            return None, orientation
+        count = struct.unpack(e + "H", tiff[off:off + 2])[0]
+        if count == 0 or off + 6 + count * 12 > len(tiff):
+            return None, orientation
+        ptr = length = 0
+        for k in range(count):
+            eo = off + 2 + k * 12
+            tag, _typ, _cnt = struct.unpack(e + "HHI", tiff[eo:eo + 8])
+            if tag == 0x0112 and not hop:       # Orientation, IFD0 only
+                value = struct.unpack(e + "H", tiff[eo + 8:eo + 10])[0]
+                if 1 <= value <= 8:
+                    orientation = value
+            elif tag == 0x0201 and hop:
+                ptr = struct.unpack(e + "I", tiff[eo + 8:eo + 12])[0]
+            elif tag == 0x0202 and hop:
+                length = struct.unpack(e + "I", tiff[eo + 8:eo + 12])[0]
+        if hop and (ptr or length):
+            if not 0 < length <= THUMB_MAX_BYTES or ptr + length > len(tiff):
+                return None, orientation
+            data = tiff[ptr:ptr + length]
+            if data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9":
+                return data, orientation
+            return None, orientation
+        off = struct.unpack(e + "I", tiff[off + 2 + count * 12:
+                                          off + 6 + count * 12])[0]
+    return None, orientation
+
+
+def jpeg_thumbnail(path: str) -> Tuple[Optional[bytes], int]:
+    """Extract the EXIF thumbnail a JPEG already carries, without decoding it.
+
+    Returns (thumbnail bytes or None, EXIF orientation 1..8). Only the file's
+    header region is read (THUMB_SCAN bytes at most, and the walk stops at the
+    first SOS). The bytes are a slice of the stored file - what the camera
+    wrote - so serving them cannot alter what a verified download contains, and
+    the shared folder gains no derived image file.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(THUMB_SCAN)
+    except OSError:
+        return None, 1
+    if head[:2] != b"\xff\xd8":
+        return None, 1
+    pos = 2
+    while pos + 4 <= len(head):
+        if head[pos] != 0xFF:
+            return None, 1
+        marker = head[pos + 1]
+        if marker == 0xFF:                      # fill byte
+            pos += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
+            pos += 2                            # standalone marker, no payload
+            if marker == 0xD9:                  # EOI: no EXIF after this
+                return None, 1
+            continue
+        seg_len = int.from_bytes(head[pos + 2:pos + 4], "big")
+        if seg_len < 2:
+            return None, 1
+        if marker == 0xDA:                      # SOS: image data starts here
+            return None, 1
+        if marker == 0xE1:
+            payload = head[pos + 4:pos + 2 + seg_len]
+            if payload[:6] == b"Exif\x00\x00":
+                thumb, orientation = _tiff_thumbnail(payload[6:])
+                if thumb:
+                    return thumb, orientation
+        pos += 2 + seg_len
+    return None, 1
+
+
 def validate_manifest(obj: Any, cfg: Config) -> Dict[str, Any]:
     """Validate the browser-supplied manifest before trusting any of it."""
     if not isinstance(obj, dict):
@@ -199,11 +314,15 @@ def validate_manifest(obj: Any, cfg: Config) -> Dict[str, Any]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    # HTTP/1.0: one request per connection, so every response ends with EOF.
-    # Range/Accept-Ranges still work (a 206 carries an exact Content-Length);
-    # the UI's preview loader reads responses with a byte bound so a shared
-    # protocol_version change can never stall it.
-    protocol_version = "HTTP/1.0"
+    # HTTP/1.1 keeps the socket open between requests, which matters a lot over
+    # a TCP tunnel: a page load and a grid of thumbnails then cost ONE TCP+TLS
+    # handshake instead of one per request. Every response therefore declares
+    # an exact Content-Length (see _send_bytes / _api_preview), and anything
+    # that cannot guarantee that (a short read while streaming, or an error
+    # raised before the request body is consumed) sets close_connection so the
+    # client never sees a truncated body followed by a new response.
+    protocol_version = "HTTP/1.1"
+    timeout = 120          # idle keep-alive / stalled write gives the socket back
     server_version = "LosslessWeb/" + WEB_VERSION
 
     @property
@@ -212,14 +331,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- low-level helpers -------------------------------------------------
     def _send_bytes(self, data: bytes, content_type: str, status: int = 200,
-                    extra: Optional[Dict[str, str]] = None) -> None:
+                    extra: Optional[Dict[str, str]] = None,
+                    cache: str = "no-store") -> None:
         # Bytes this response body will contain. _api_preview consults it so a
         # HEAD request answers with identical headers and no body.
         self._body_bytes = len(data)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        # Exactly one Cache-Control header: two would intersect to no-store and
+        # silently defeat the thumbnail cache.
+        self.send_header("Cache-Control", cache)
         if extra:
             for k, v in extra.items():
                 self.send_header(k, v)
@@ -227,7 +349,7 @@ class Handler(BaseHTTPRequestHandler):
         if data and self.command != "HEAD":
             try:
                 self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 self.close_connection = True
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
@@ -352,7 +474,12 @@ class Handler(BaseHTTPRequestHandler):
                     pos += len(piece)
                     remaining -= len(piece)
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
+        if remaining > 0:
+            # Fewer bytes than Content-Length promised (the file shrank while
+            # we were reading it): the framing is now unreliable, so drop the
+            # connection instead of letting a kept-alive socket desync.
             self.close_connection = True
 
     # ---- routing -----------------------------------------------------------
@@ -366,9 +493,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         else:
             raise HTTPError(404, "not found")
-        with open(os.path.join(WEB_DIR, fname), "rb") as f:
+        full = os.path.join(WEB_DIR, fname)
+        with open(full, "rb") as f:
             data = f.read()
-        self._send_bytes(data, STATIC_TYPES[fname])
+        st = os.stat(full)
+        etag = '"%x-%x"' % (st.st_size, getattr(st, "st_mtime_ns",
+                                                int(st.st_mtime * 1e9)))
+        # Revalidate on every load ("no-cache" still allows a cached copy to be
+        # *reused* once confirmed), so an updated app.js is picked up at once,
+        # while an unchanged one costs a bodyless 304 instead of ~60 KB over a
+        # tunnel.
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
+        self._send_bytes(data, STATIC_TYPES[fname], 200, {
+            "ETag": etag,
+            "Last-Modified": self.date_time_string(st.st_mtime),
+        }, cache="no-cache")
 
     def _route(self, method: str) -> None:
         path, q = self._parts()
@@ -395,6 +539,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_download_chunk(q)
         if path == "/api/preview" and method == "GET":
             return self._api_preview(q)
+        if path == "/api/thumb" and method == "GET":
+            return self._api_thumb(q)
         if path == "/api/delete" and method == "POST":
             return self._api_delete()
         raise HTTPError(404, "unknown endpoint")
@@ -415,6 +561,8 @@ class Handler(BaseHTTPRequestHandler):
                            if self.cfg.token else "",
             "preview_ext": {"image": sorted(IMAGE_TYPES),
                             "video": sorted(VIDEO_TYPES)},
+            # /api/thumb can answer with the JPEG's own EXIF thumbnail
+            "thumb_ext": list(JPEG_EXTS),
         })
 
     def _api_list(self) -> None:
@@ -649,6 +797,48 @@ class Handler(BaseHTTPRequestHandler):
         if length and self.command != "HEAD":
             self._stream_file(dest, start, length)
 
+    # ---- API: thumbnail ----------------------------------------------------
+    def _api_thumb(self, q) -> None:
+        """GET /api/thumb?name=... -> the JPEG's own EXIF thumbnail (tiny!).
+
+        A camera JPEG already contains a 10-30 KB thumbnail that the camera
+        wrote; handing *that* to the grid turns a 10 MB transfer over the
+        tunnel into a few KB, and it is a byte slice of the stored file, so
+        nothing is generated, resized, re-encoded or written to disk.
+
+        415 means "this file carries no usable embedded thumbnail" - the UI
+        then falls back to /api/preview (a prefix of the original, or all of
+        it). That is why 415 here must NOT be read as "unpreviewable".
+        """
+        name = safe_name(self._qs(q, "name"))
+        kind, _ctype = media_type(name)
+        if kind != "image":
+            raise HTTPError(415, "only images have a thumbnail")
+        dest = os.path.join(self.cfg.dir, name)
+        if not os.path.isfile(dest):
+            raise HTTPError(404, "file not found")
+        st = os.stat(dest)
+        etag = '"t%x-%x"' % (st.st_size, getattr(st, "st_mtime_ns",
+                                                 int(st.st_mtime * 1e9)))
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=604800")
+            self.end_headers()
+            return
+        thumb, orientation = ((jpeg_thumbnail(dest)
+                               if os.path.splitext(name)[1].lower() in JPEG_EXTS
+                               else (None, 1)))
+        if not thumb:
+            raise HTTPError(415, "no embedded thumbnail in this image")
+        self._send_bytes(thumb, "image/jpeg", 200, {
+            "ETag": etag,
+            # The thumbnail is a bare JPEG: it carries no orientation tag, so
+            # the client is told how to turn it (EXIF 0x0112 of the main file).
+            "X-Thumb-Orientation": str(orientation),
+            "X-Content-Type-Options": "nosniff",
+        }, cache="private, max-age=604800")  # immutable for this (size, mtime)
+
     # ---- API: delete -------------------------------------------------------
     def _api_delete(self) -> None:
         body = self._read_json(MAX_SMALL_BODY)
@@ -681,7 +871,8 @@ class Handler(BaseHTTPRequestHandler):
         except HTTPError as exc:
             self.close_connection = True  # avoid keep-alive body desync on error
             self._send_json({"error": exc.message}, exc.status)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError,
+                ssl.SSLError):
             self.close_connection = True
         except Exception as exc:  # pragma: no cover - defensive
             traceback.print_exc()
@@ -706,8 +897,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bind address (default 0.0.0.0)")
     p.add_argument("--port", type=int, default=8765,
                    help="TCP port (default 8765)")
-    p.add_argument("--dir", default="received",
-                   help="directory that stores received files (default ./received)")
+    p.add_argument("--dir", default="shared",
+                   help="the web library folder: files visible on the page "
+                        "(default ./shared, the same default as "
+                        "scripts/start_web.ps1)")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
     p.add_argument("--token", default=None,

@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import ssl
+import struct
 import sys
 import tempfile
 import threading
@@ -87,6 +88,40 @@ def browser_manifest(name: str, data: bytes) -> dict:
         "chunks": chunks,
         "mtime_ns": MTIME_NS,
     }
+
+
+def jpeg_with_exif_thumb(thumb: bytes, big_endian: bool = False,
+                         orientation: int = 1) -> bytes:
+    """A minimal JPEG carrying `thumb` as its EXIF IFD1 thumbnail.
+
+    Structured exactly like a camera file: SOI, one APP1 "Exif" segment whose
+    TIFF block has IFD0 (Orientation) chained to IFD1 (0x0201/0x0202 pointing
+    at the thumbnail bytes), then EOI.
+    """
+    e = ">" if big_endian else "<"
+    tiff = bytearray(b"MM" if big_endian else b"II")
+    tiff += struct.pack(e + "H", 42)
+    tiff += struct.pack(e + "I", 8)                  # IFD0 offset
+    ifd0_off = 8
+    ifd0_len = 2 + 1 * 12 + 4
+    ifd1_off = ifd0_off + ifd0_len
+    ifd1_len = 2 + 2 * 12 + 4
+    thumb_off = ifd1_off + ifd1_len
+    tiff += struct.pack(e + "H", 1)                  # IFD0: 1 entry
+    tiff += struct.pack(e + "HHI", 0x0112, 3, 1)     # Orientation, SHORT
+    tiff += struct.pack(e + "H", orientation) + b"\x00\x00"
+    tiff += struct.pack(e + "I", ifd1_off)           # chain to IFD1
+    tiff += struct.pack(e + "H", 2)                  # IFD1: 2 entries
+    tiff += struct.pack(e + "HHI", 0x0201, 4, 1)     # JPEGInterchangeFormat
+    tiff += struct.pack(e + "I", thumb_off)
+    tiff += struct.pack(e + "HHI", 0x0202, 4, 1)     # ...Length
+    tiff += struct.pack(e + "I", len(thumb))
+    tiff += struct.pack(e + "I", 0)                  # IFD1 has no successor
+    assert len(tiff) == thumb_off
+    tiff += thumb
+    payload = b"Exif\x00\x00" + bytes(tiff)
+    app1 = b"\xff\xe1" + struct.pack(">H", len(payload) + 2) + payload
+    return b"\xff\xd8" + app1 + b"\xff\xd9"
 
 
 class WebTransferE2E(unittest.TestCase):
@@ -361,6 +396,142 @@ class WebTransferE2E(unittest.TestCase):
         st, _, b = self.req("GET", "/api/list")
         self.assertNotIn("empty.bin",
                          [f["name"] for f in json.loads(b)["files"]])
+
+    # ---- preview / thumbnail -----------------------------------------------
+    def test_15_static_files_revalidate_with_etag(self):
+        st, h, b = self.req("GET", "/app.js", token=None)
+        self.assertEqual(st, 200)
+        self.assertIn(b"LTSha256", b)
+        etag = h.get("etag")
+        self.assertTrue(etag, "static files must carry an ETag")
+        self.assertIn("no-cache", h.get("cache-control", ""))
+        st2, h2, b2 = self.req("GET", "/app.js", token=None,
+                               headers={"If-None-Match": etag})
+        self.assertEqual(st2, 304, "an unchanged asset must cost no body")
+        self.assertEqual(b2, b"")
+        self.assertEqual(h2.get("etag"), etag)
+
+    def test_16_keepalive_serves_many_requests_on_one_socket(self):
+        # HTTP/1.1 keep-alive is what stops a page load from paying a fresh
+        # TCP (+TLS) handshake for every request over a tunnel.
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        try:
+            for _ in range(3):
+                conn.request("GET", "/api/info",
+                             headers={"X-LT-Token": TOKEN})
+                resp = conn.getresponse()
+                body = resp.read()
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.version, 11, "must speak HTTP/1.1")
+                self.assertEqual(json.loads(body)["service"],
+                                 "lossless-transfer-web")
+        finally:
+            conn.close()
+
+    def test_17_thumb_endpoint_serves_the_embedded_exif_thumbnail(self):
+        thumb = b"\xff\xd8" + b"EMBEDDED-THUMB" * 8 + b"\xff\xd9"
+        jpg_path = os.path.join(self.lib, "WITH_THUMB.JPG")
+        with open(jpg_path, "wb") as f:
+            # stored sideways, like a camera shot in portrait
+            f.write(jpeg_with_exif_thumb(thumb, orientation=8))
+        noexif_path = os.path.join(self.lib, "NO_EXIF.JPG")
+        with open(noexif_path, "wb") as f:
+            f.write(b"\xff\xd8\xff\xd9")
+        try:
+            st, h, b = self.req("GET", "/api/thumb?name=WITH_THUMB.JPG")
+            self.assertEqual(st, 200, b[:300])
+            self.assertEqual(h.get("content-type"), "image/jpeg")
+            self.assertEqual(b, thumb, "must be the file's own thumb bytes")
+            # the thumb itself has no EXIF: the grid needs this to turn it
+            self.assertEqual(h.get("x-thumb-orientation"), "8")
+            etag = h.get("etag")
+            self.assertTrue(etag)
+            self.assertIn("max-age", h.get("cache-control", ""))
+            st2, _, b2 = self.req("GET", "/api/thumb?name=WITH_THUMB.JPG",
+                                  headers={"If-None-Match": etag})
+            self.assertEqual(st2, 304)
+            self.assertEqual(b2, b"")
+
+            # No EXIF block -> 415 "no thumbnail", which the UI must not read
+            # as "unpreviewable": /api/preview still streams the file.
+            st3, _, _ = self.req("GET", "/api/thumb?name=NO_EXIF.JPG")
+            self.assertEqual(st3, 415)
+            st4, _, b4 = self.req("GET", "/api/preview?name=NO_EXIF.JPG")
+            self.assertEqual(st4, 200)
+            self.assertEqual(b4, b"\xff\xd8\xff\xd9")
+
+            # only JPEGs can carry this thumbnail; anything else answers 415
+            st5, _, _ = self.req("GET", "/api/thumb?name=DSC_0001.NEF")
+            self.assertEqual(st5, 415)
+            st6, _, _ = self.req("GET", "/api/thumb?name=../escape.JPG")
+            self.assertEqual(st6, 400)
+            st7, _, _ = self.req("GET", "/api/thumb?name=missing.JPG")
+            self.assertEqual(st7, 404)
+        finally:
+            os.remove(jpg_path)
+            os.remove(noexif_path)
+
+
+class ThumbExtraction(unittest.TestCase):
+    """Pure-Python EXIF thumbnail extraction: byte order, bounds, junk input."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="lt-thumb-test-")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def write(self, name: str, data: bytes) -> str:
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_reads_both_byte_orders(self):
+        thumb = b"\xff\xd8" + b"THUMB" * 13 + b"\xff\xd9"
+        for big in (False, True):
+            path = self.write("t%s.JPG" % big,
+                              jpeg_with_exif_thumb(thumb, big_endian=big))
+            got, orient = wt.jpeg_thumbnail(path)
+            self.assertEqual(got, thumb, "big_endian=%s" % big)
+            self.assertEqual(orient, 1)
+
+    def test_reads_the_orientation_tag(self):
+        # A camera photo stored sideways must report it, because the extracted
+        # thumbnail is a bare JPEG that carries no orientation of its own.
+        thumb = b"\xff\xd8" + b"THUMB" * 9 + b"\xff\xd9"
+        for o in (1, 3, 6, 8):
+            for big in (False, True):
+                path = self.write("o%d%s.JPG" % (o, big),
+                                  jpeg_with_exif_thumb(thumb, big_endian=big,
+                                                       orientation=o))
+                self.assertEqual(wt.jpeg_thumbnail(path), (thumb, o),
+                                 "orientation=%d big=%s" % (o, big))
+        # out-of-range orientation falls back to 1 (upright) instead of
+        # handing the UI a transform it does not know
+        path = self.write("bad.JPG", jpeg_with_exif_thumb(thumb, orientation=99))
+        self.assertEqual(wt.jpeg_thumbnail(path), (thumb, 1))
+
+    def test_rejects_files_without_a_usable_thumbnail(self):
+        # not a JPEG at all
+        png = self.write("a.PNG", b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        self.assertIsNone(wt.jpeg_thumbnail(png)[0])
+        # JPEG with no EXIF segment
+        plain = self.write("b.JPG", b"\xff\xd8\xff\xdb\x00\x08" + b"\x00" * 16 +
+                           b"\xff\xd9")
+        self.assertIsNone(wt.jpeg_thumbnail(plain)[0])
+        # EXIF whose IFD1 thumbnail length lies about the data: must not raise
+        broken = bytearray(jpeg_with_exif_thumb(b"\xff\xd8\xff\xd9"))
+        at = broken.index(struct.pack("<HHI", 0x0202, 4, 1)) + 8
+        broken[at:at + 4] = struct.pack("<I", 0xFFFFF0)
+        path = self.write("c.JPG", bytes(broken))
+        self.assertIsNone(wt.jpeg_thumbnail(path)[0])
+        # truncated header region
+        self.assertIsNone(wt.jpeg_thumbnail(
+            self.write("d.JPG", b"\xff\xd8\xff\xe1"))[0])
+        # missing file
+        self.assertIsNone(wt.jpeg_thumbnail(
+            os.path.join(self.tmp, "nope.JPG"))[0])
 
 
 class WebTransferTLS(unittest.TestCase):

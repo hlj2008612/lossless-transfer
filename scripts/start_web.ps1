@@ -32,7 +32,10 @@
 [CmdletBinding()]
 param(
     [int]      $Port           = 8765,
-    [string]   $Dir            = 'received',
+    # The folder the page calls 资料库. 'shared' is the web library (it is what
+    # the tunnel exposes and what README documents); the CLI receiver writes to
+    # 'received' instead, so the two never mix by accident.
+    [string]   $Dir            = 'shared',
     [string]   $Token          = '',
     # Open mode: no token. Anyone who reaches the URL can upload/download/delete.
     [switch]   $Open,

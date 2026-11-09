@@ -342,10 +342,10 @@
   }
 
   // ---- preview fetching ---------------------------------------------------
-  // Every preview byte comes from GET /api/preview with the token header, so
-  // no file ever needs to be in the static whitelist.
-  var PREVIEW_CONCURRENCY = 4;   // thumbnails at once: gentle on a tunnel
-  var PREVIEW_TIMEOUT_MS = 30000;
+  // Every preview byte comes from GET /api/thumb or /api/preview with the
+  // X-LT-Token header, so no file ever needs to be in the static whitelist.
+  var PREVIEW_CONCURRENCY = 4;   // preview requests at once: gentle on a tunnel
+  var PREVIEW_IDLE_MS = 25000;   // abort only when the stream stops moving
   var previewSlots = PREVIEW_CONCURRENCY;
   var previewWaiters = [];
   var previewControllers = {};   // name+version -> AbortController (live only)
@@ -359,13 +359,21 @@
     if (next) next(); else previewSlots++;
   }
 
+  // `index` is a hint the server validates but never uses to pick a file, and
+  // `v` (size-mtime) changes whenever the stored bytes change, so a cached
+  // preview can never be shown for a different version of the same name.
+  function versionQuery(f) { return '&v=' + f.size + '-' + f.mtime_ns; }
   function previewPath(f, index) {
-    return '/api/preview?name=' + qs(f.name) + '&index=' + (index || 0);
+    return '/api/preview?name=' + qs(f.name) + '&index=' + (index || 0) +
+           versionQuery(f);
+  }
+  function thumbPath(f) {
+    return '/api/thumb?name=' + qs(f.name) + versionQuery(f);
   }
 
-  // Read the response body, bounded by Content-Length. With HTTP/1.0 the
-  // body ends at EOF, so honouring the declared length keeps this correct
-  // even if keep-alive is ever enabled. With a Range it streams to memory.
+  // Read the response body, bounded by Content-Length. fetch() already frames
+  // HTTP/1.1 keep-alive responses, and honouring the declared length on top of
+  // that keeps this correct whatever the transport does.
   async function readPreviewBytes(res, onProgress) {
     var len = parseInt(res.headers.get('Content-Length') || '0', 10) || 0;
     if (!res.body || !res.body.getReader || !len) {
@@ -387,26 +395,45 @@
     return got === len ? out : out.subarray(0, got);
   }
 
-  // Ranged fetch used by the thumbnail <img> when the tunnel/resource does
-  // not support 206 responses: pull the first `want` bytes in one request,
-  // then try to decode with createImageBitmap (which needs complete data).
-  async function probeImage(f, index, want) {
-    return fetchRangedHead(f, index, want);
+  // One GET -> Blob. A non-2xx answer becomes an Error carrying .status plus
+  // the server's message, so callers can tell 415 (nothing to preview) from
+  // 401 (token) and from a transport failure.
+  async function fetchBlob(path, headers, onProgress, signal) {
+    var res = await fetch(path, { headers: headers, signal: signal });
+    if (!res.ok) {
+      var msg = 'HTTP ' + res.status;
+      try { msg = (await res.json()).error || msg; } catch (e) { /* not JSON */ }
+      var err = new Error(msg);
+      err.status = res.status;
+      throw err;
+    }
+    var bytes = await readPreviewBytes(res, onProgress);
+    return new Blob([bytes], { type: res.headers.get('Content-Type') || '' });
   }
 
-  async function fetchRangedHead(f, index, want) {
+  // The camera's own EXIF thumbnail (~10-30 KB, always a complete JPEG). This
+  // is the fast path for every camera/phone photo: one tiny request instead of
+  // pulling a 10 MB original over the tunnel. null = no embedded thumbnail.
+  //
+  // It comes back with `orient` (EXIF 0x0112 of the main file): the thumbnail
+  // is a bare JPEG with no EXIF of its own, so a photo shot in portrait would
+  // otherwise sit sideways in the grid while the full image - which the
+  // browser turns using the main file's tag - looks right.
+  async function fetchThumbBlob(f) {
     await takePreviewSlot();
     try {
-      var res = await fetch(previewPath(f, index), {
-        headers: { 'X-LT-Token': token, 'Range': 'bytes=0-' + (want - 1) }
-      });
-      if (!res.ok && res.status !== 206) return null;
+      var res = await fetch(thumbPath(f), { headers: { 'X-LT-Token': token } });
+      if (!res.ok) {
+        try { res.body && res.body.cancel(); } catch (e) { /* ignore */ }
+        return null;
+      }
       var bytes = await readPreviewBytes(res);
       if (!bytes.length) return null;
-      var blob = new Blob([bytes], { type: res.headers.get('Content-Type') || '' });
-      // Complete only if the server really capped the range at `want`.
-      if (bytes.length < want) return blob;
-      return await decodeLimit(blob);
+      var orient = parseInt(res.headers.get('X-Thumb-Orientation') || '1', 10);
+      return {
+        blob: new Blob([bytes], { type: 'image/jpeg' }),
+        orient: (orient >= 2 && orient <= 8) ? orient : 1
+      };
     } catch (e) {
       return null;
     } finally {
@@ -414,27 +441,44 @@
     }
   }
 
-  function decodeLimit(blob) {
-    if (typeof createImageBitmap !== 'function') return Promise.resolve(null);
-    return createImageBitmap(blob).then(function (bmp) {
-      if (bmp.close) bmp.close();
-      return blob;
-    }, function () { return null; });
+  // A truncated JPEG renders its WHOLE frame only when it is progressive
+  // (SOF2). A truncated baseline JPEG (SOF0/1) - and a truncated PNG, whose
+  // rows come top-down - paints just the top band, which reads as a broken
+  // picture, so those need the complete file before they may be shown.
+  function fillsFrameFromPrefix(bytes) {
+    var pos = 2;                                  // past SOI (checked by SOF0)
+    while (pos + 4 <= bytes.length) {
+      if (bytes[pos] !== 0xFF) return false;
+      var m = bytes[pos + 1];
+      if (m === 0xFF) { pos += 1; continue; }
+      if (m === 0x01 || (m >= 0xD0 && m <= 0xD9)) { pos += 2; continue; }
+      if (m === 0xDA) return false;               // scan started, no SOF2 found
+      var len = (bytes[pos + 2] << 8) | bytes[pos + 3];
+      if (len < 2) return false;
+      if (m === 0xC2) return true;                // progressive JPEG
+      if (m === 0xC0 || m === 0xC1) return false; // baseline / extended
+      pos += 2 + len;
+    }
+    return false;
   }
 
-  // Fallback: first `want` bytes, then let the browser's own decoder decide
-  // (an <img> with just a header often renders the full image already).
-  async function fetchHeadBytes(f, index, want) {
+  // First `want` bytes of the file. `complete` means the server capped the
+  // range at the file's real size, i.e. these bytes ARE the whole file.
+  async function fetchPrefix(f, index, want) {
     await takePreviewSlot();
     try {
-      var res = await fetch(previewPath(f, index), {
-        headers: { 'X-LT-Token': token, 'Range': 'bytes=0-' + (want - 1) }
+      var blob = await fetchBlob(previewPath(f, index), {
+        'X-LT-Token': token, 'Range': 'bytes=0-' + (want - 1)
       });
-      if (!res.ok && res.status !== 206) return null;
-      var bytes = await readPreviewBytes(res);
-      if (!bytes.length) return null;
-      return new Blob([bytes], { type: res.headers.get('Content-Type') || '' });
+      var complete = blob.size < want;
+      var partialOk = false;
+      if (!complete) {
+        var head = new Uint8Array(await blob.slice(0, 65536).arrayBuffer());
+        partialOk = fillsFrameFromPrefix(head);
+      }
+      return { blob: blob, complete: complete, partialOk: partialOk };
     } catch (e) {
+      if (e && e.status) return { blob: null, status: e.status };
       return null;
     } finally {
       releasePreviewSlot();
@@ -443,34 +487,35 @@
 
   // Full (Range-less) preview blob with progress - used by the lightbox for
   // images and, where MediaSource is missing (plain HTTP), for videos.
+  // The timeout is idle-based: as long as bytes keep arriving a 10 MB photo on
+  // a slow tunnel is allowed to finish (a fixed 30 s cap used to abort it and
+  // leave the card stuck in its loading state).
   function fetchPreviewBlob(f, index, onProgress) {
     var key = f.name + '#' + index;
     var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
     previewControllers[key] = ctrl;
-    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, PREVIEW_TIMEOUT_MS);
+    var timer = 0;
+    function arm() {
+      clearTimeout(timer);
+      timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, PREVIEW_IDLE_MS);
+    }
     function done() {
       clearTimeout(timer);
       delete previewControllers[key];
     }
-    return takePreviewSlot().then(async function () {
-      try {
-        var res = await fetch(previewPath(f, index), {
-          headers: { 'X-LT-Token': token },
-          signal: ctrl ? ctrl.signal : undefined
-        });
-        if (!res.ok) {
-          var msg = 'HTTP ' + res.status;
-          try { msg = (await res.json()).error || msg; } catch (e) { /* not JSON */ }
-          var err = new Error(msg); err.status = res.status; throw err;
-        }
-        var bytes = await readPreviewBytes(res, onProgress);
-        return new Blob([bytes], { type: res.headers.get('Content-Type') || '' });
-      } finally {
-        releasePreviewSlot();
-        done();
-      }
+    return takePreviewSlot().then(function () {
+      arm();                      // start counting only once the request runs
+      return fetchBlob(previewPath(f, index), { 'X-LT-Token': token },
+        function (got, total) {
+          arm();
+          if (onProgress) onProgress(got, total);
+        },
+        ctrl ? ctrl.signal : undefined);
+    }).then(function (blob) {
+      done(); releasePreviewSlot();
+      return blob;
     }, function (e) {
-      done();
+      done(); releasePreviewSlot();
       throw e;
     });
   }
@@ -567,15 +612,25 @@
     }).catch(function () { finish(false); });
   }
 
-  function thumbFail(card, status) {
+  function thumbFail(card, status, note) {
     card.el.classList.remove('is-loading');
-    card.el.classList.add('thumb-unsupported');
-    // 415 = the server says this type is not previewable: no point retrying.
-    if (status === 415) markNoPreview(card.file.name, '此格式浏览器无法预览，请下载查看');
+    if (card.thumbOk) return;             // something is already on screen
+    var unpreviewable = status === 415;
+    // Only a format the browser cannot render gets the hatched "no preview"
+    // surface; "too big to fetch for a card / undecodable" just keeps the
+    // quiet placeholder with its explanation.
+    if (unpreviewable) card.el.classList.add('thumb-unsupported');
+    var kindEl = card.el.querySelector('.card-ph-kind');
+    if (kindEl) kindEl.textContent = note || '无法预览';
+    // 415 = the server will not hand out these bytes in a form a browser can
+    // render (CR3/NEF/RAW...): no point retrying in the lightbox either.
+    if (unpreviewable) {
+      markNoPreview(card.file.name, '此格式浏览器无法预览，请下载查看');
+    }
   }
 
   function markNoPreview(name, reason) {
-    var entry = viewed.find(function (v) { return v.name === name; });
+    var entry = viewed.find(function (v) { return v.file.name === name; });
     if (entry) entry.unpreviewable = reason;
     var card = cards[name];
     if (card) {
@@ -584,53 +639,74 @@
     }
   }
 
-  function setThumb(card, blob) {
-    if (card.thumbUrl) URL.revokeObjectURL(card.thumbUrl);
-    card.thumbUrl = URL.createObjectURL(blob);
+  // Put a blob on the card's <img> and let the browser's decoder be the judge:
+  // when these bytes cannot be rendered the card keeps its placeholder and the
+  // caller tries a larger slice. Resolves true only when something was shown.
+  // `orient` is the EXIF orientation to apply - only the embedded thumbnail
+  // needs it; a full file carries its own tag and the browser turns it.
+  function showOnCard(card, blob, orient) {
     var img = card.el.querySelector('.card-thumb');
-    img.onload = null;
-    img.src = card.thumbUrl;
-    card.el.classList.remove('is-loading');
-    card.el.classList.add('thumb-loaded');
-  }
-
-  async function viaImg(card, blob) {
-    var img = card.el.querySelector('.card-thumb');
+    if (!img) return Promise.resolve(false);
     return new Promise(function (resolve) {
       var url = URL.createObjectURL(blob);
-      img.onload = function () { img.onload = null; resolve(url); };
-      img.onerror = function () {
+      function done(ok) {
+        img.onload = null;
         img.onerror = null;
-        URL.revokeObjectURL(url);
-        resolve(null);
-      };
+        if (!ok) { URL.revokeObjectURL(url); resolve(false); return; }
+        if (card.thumbUrl) URL.revokeObjectURL(card.thumbUrl);
+        card.thumbUrl = url;
+        card.thumbOk = true;
+        card.orient = (orient >= 2 && orient <= 8) ? orient : 1;
+        if (card.orient > 1) card.el.setAttribute('data-orient', card.orient);
+        else card.el.removeAttribute('data-orient');
+        card.el.classList.remove('is-loading', 'thumb-unsupported');
+        card.el.classList.add('thumb-loaded');
+        resolve(true);
+      }
+      img.onload = function () { done(img.naturalWidth > 0); };
+      img.onerror = function () { done(false); };
       img.src = url;
     });
   }
 
-  // Progressive: 128 KiB header first, then 512 KiB, then the whole image.
-  // Most JPEGs show their (embedded) thumbnail after the first step, and a
-  // whole-image read only happens where neither a plain <img> nor a Range
-  // could do it - all of it bounded by the same concurrency limiter.
+  // Thumbnail strategy, cheapest first:
+  //   1. the camera's embedded EXIF thumbnail - one ~20 KB request, and always
+  //      a complete JPEG (covers nearly every camera/phone photo);
+  //   2. a prefix of the file (256 KiB, 1 MiB, 3 MiB), shown only when the
+  //      format fills the frame from partial data (progressive JPEG);
+  //   3. the whole file, streamed - for everything else, and never for a big
+  //      one (a card must not pull 40 MB; it says "点开查看" and the lightbox
+  //      does that work on demand).
+  var PREFIX_STEPS = [262144, 1048576, 3145728];
+  var THUMB_FULL_MAX = 8 << 20;
+
   async function loadThumb(card) {
-    var f = card.file;
-    if (card.loading) return;
+    if (card.loading || card.thumbOk) return;
     card.loading = true;
+    var f = card.file;
     var index = card.index;
     try {
-      var blob = await fetchRangedHead(f, index, 131072);
-      if (!blob) return thumbFail(card);
-      var url = await viaImg(card, blob);
-      if (url) { setThumb(card, blob); URL.revokeObjectURL(url); return; }
-      blob = await fetchRangedHead(f, index, 524288) || await fetchHeadBytes(f, index, 524288);
-      if (blob && await viaImg(card, blob)) { setThumb(card, blob); return; }
-      var probe = await probeImage(f, index, 4 << 20);
-      if (probe) { setThumb(card, probe); return; }
-      // Last resort: the complete image.
-      blob = await fetchPreviewBlob(f, index);
-      if (blob) setThumb(card, blob); else thumbFail(card);
+      var small = await fetchThumbBlob(f);
+      if (small && await showOnCard(card, small.blob, small.orient)) return;
+
+      for (var i = 0; i < PREFIX_STEPS.length; i++) {
+        var head = await fetchPrefix(f, index, PREFIX_STEPS[i]);
+        if (!head || !head.blob) return thumbFail(card, head && head.status);
+        // Complete data is definitive: it renders or the file cannot be shown.
+        if (head.complete) {
+          if (await showOnCard(card, head.blob)) return;
+          return thumbFail(card, head.status, '无法解码');
+        }
+        if (head.partialOk && await showOnCard(card, head.blob)) return;
+      }
+      if (f.size > THUMB_FULL_MAX) return thumbFail(card, 0, '点开查看');
+
+      var whole = await fetchPreviewBlob(f, index);
+      if (whole && await showOnCard(card, whole)) return;
+      thumbFail(card);
     } catch (e) {
-      if (!(e && e.name === 'AbortError')) thumbFail(card, e && e.status);
+      // Includes the idle-timeout abort: a card must never stay pulsing.
+      thumbFail(card, e && e.status);
     } finally {
       card.loading = false;
     }
@@ -656,6 +732,13 @@
       img.decoding = 'async';
       img.draggable = false;
       fig.appendChild(img);
+      // Placeholder under the picture: it pulses while the thumbnail is on its
+      // way and carries the reason if the image can never be shown.
+      var ph = document.createElement('div');
+      ph.className = 'card-ph';
+      ph.innerHTML = '<span class="card-ph-icon">▣</span>' +
+        '<span class="card-ph-kind">照片</span>';
+      fig.appendChild(ph);
     } else {
       fig.innerHTML = '<div class="card-ph"><span class="card-ph-icon">' +
         thumbIcon(f.kind) + '</span><span class="card-ph-kind">' +
@@ -733,7 +816,8 @@
     el.appendChild(acts);
 
     return {
-      file: f, index: index, el: el, thumbUrl: null, loading: false
+      file: f, index: index, el: el, thumbUrl: null, thumbOk: false,
+      loading: false
     };
   }
 
@@ -980,6 +1064,8 @@
     try { v.load(); } catch (e) { /* ignore */ }
     var img = lbEl('.lb-img');
     img.removeAttribute('src');
+    img.removeAttribute('data-orient');
+    img.classList.remove('lb-blur');
     img.classList.add('hidden');
     v.classList.add('hidden');
     lbEl('.lb-fallback').classList.add('hidden');
@@ -1040,16 +1126,44 @@
 
     if (f.kind === 'image') {
       var img = lbEl('.lb-img');
+      var root = lb.el;
+      var sub = lbEl('.lb-sub');
+      var subText = sub.textContent;
       img.classList.remove('hidden');
       img.alt = f.name;
-      fetchPreviewBlob(f, entry.thumbIndex).then(function (blob) {
+      img.classList.remove('lb-blur');
+      img.removeAttribute('data-orient');
+      // Show what the grid already decoded (usually the 20 KB EXIF thumbnail)
+      // so the stage is never blank, then swap in the full-resolution bytes.
+      // A thumbnail stored sideways (orientation 6/8) would have to be laid
+      // out rotated inside a contain-sized box, so those just get the spinner.
+      var card = cards[f.name];
+      var orient = (card && card.orient) || 1;
+      if (card && card.thumbUrl && orient <= 4) {
+        img.src = card.thumbUrl;
+        if (orient > 1) img.setAttribute('data-orient', orient);
+        img.classList.add('lb-blur');
+      } else {
+        root.classList.add('lb-loading');
+      }
+      fetchPreviewBlob(f, entry.thumbIndex, function (got, total) {
+        if (seq !== lb.state.seq || !total) return;
+        sub.textContent = subText + ' · 载入 ' +
+          Math.floor(got / total * 100) + '%';
+      }).then(function (blob) {
         if (seq !== lb.state.seq) return;
-        lbEl('.lb-img').closest('.lb').classList.remove('lb-loading');
+        root.classList.remove('lb-loading');
+        sub.textContent = subText;
+        img.classList.remove('lb-blur');
+        img.removeAttribute('data-orient');
         lb.currentUrl = URL.createObjectURL(blob);
         img.src = lb.currentUrl;
       }).catch(function (e) {
         if (seq !== lb.state.seq) return;
-        lbEl('.lb').classList.remove('lb-loading');
+        root.classList.remove('lb-loading');
+        sub.textContent = subText;
+        img.classList.remove('lb-blur');
+        img.removeAttribute('data-orient');
         if (e && e.status === 415) {
           entry.unpreviewable = e.message;
           showLbFallback(e.message);

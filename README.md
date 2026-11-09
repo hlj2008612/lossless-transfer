@@ -58,6 +58,9 @@
 | **自写纯 JS SHA-256** (`web/sha256.js`) | 普通 TCP 隧道 / 局域网常是明文 HTTP，属于**非安全上下文**，`window.crypto.subtle` 会被浏览器禁用；因此自带增量式 SHA-256，且避免把整个视频读进内存。开启 HTTPS 后浏览器原生 `crypto.subtle` 也可用，但本项目仍统一用自带实现，行为一致 |
 | 令牌鉴权 `X-LT-Token` | 隧道把端口暴露到公网，必须有一道口令（`hmac.compare_digest` 常量时间比对）；比 CLI 的「无认证」更进一步。`/api/preview` 额外接受只读的 `media_token`（查询参数 `t=`），因为 `<video>`/`<img>` 发不了自定义请求头；它不能调用任何其他接口 |
 | 预览 = 原文件原字节 | 缩略图与大图都直接读取原文件字节交给浏览器解码，服务端不生成、不缓存、不落盘任何派生图像（派生图一旦保存，就有被当成「原图」拿走的隐患）；视频用 `Range` 分段流式读取，拖进度条不会整段下载 |
+| `/api/thumb` 取「相机自带」缩略图 | 相机 JPEG 的 EXIF 里本来就有一段 10–30 KB 的缩略图。服务端只从文件头部把**这段已有的字节**切出来返回（内存中转，不落盘、不解码、不重编码），因此一屏 10 MB 的原图在隧道上只花几十 KB 就能出图；没有内嵌缩略图就返回 `415`，前端再退回读原文件头部 |
+| HTTP/1.1 keep-alive | 隧道上每次请求都要重新 TCP + TLS 握手，代价远大于响应本身。开启连接复用后「首页 + 4 个静态文件 + 每个缩略图」共享一条连接；`Content-Length` 精确、流式短读/异常一律主动断连，避免 1.1 的分帧错位 |
+| 静态资源 `ETag` + `no-cache` | 重新加载时静态文件走 `304`（无 body），既有更新立刻生效，又不重复传 60 KB；缩略图与预览带 `max-age`，同一版本只下一次 |
 | **原生 HTTPS**（可选 `--tls-cert/--tls-key`） | 标准库 `ssl.SSLContext` 直接把监听 socket 包成 TLS；内地 SakuraFrp 节点按合规要求拦截明文 HTTP（返回 501），但放行 TLS 字节流，因此跨公网必须让链路是 HTTPS。配套 `scripts/gen_cert.ps1` 零依赖生成自签证书 |
 | 大分块（默认 4 MiB） | 隧道上往返延迟更高，加大块减少请求数 |
 
@@ -171,13 +174,13 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Open -Dir shared
 ### 本机 / 局域网快速体验
 **接收端（跑服务端，先启动）**
 ```bash
-python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./received --token 你自己的口令
+python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./shared --token 你自己的口令
 ```
 Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一个**并打印在启动日志里。加 `--tls-cert`/`--tls-key` 则改为原生 HTTPS（跨公网 / 内地节点必需，见下一节）。启动后终端会打印类似：
 
 ```
-  lossless-transfer  WEB  v1.2.0   (Python stdlib only)
-  Library dir  : D:\...\无损传输\received
+  lossless-transfer  WEB  v1.3.0   (Python stdlib only)
+  Library dir  : D:\...\无损传输\shared
   Chunk size   : 4194304 bytes (4.0 MiB)
   Local URL    : http://127.0.0.1:8765     # 加了证书则是 https://
   ACCESS TOKEN : xxxxxxxxxxxxxxxxxxxxxx
@@ -188,11 +191,11 @@ Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一�
 **发送端（任何有浏览器的设备）**：打开 `http://<接收端IP>:8765` → 在「连接」卡片填入上面的 `ACCESS TOKEN` → 点「连接」。之后：
 
 - **上传**：把照片 / 视频拖进虚线框（或点「选择文件」，可多选）。浏览器先用纯 JS 逐块算 SHA-256 → 分块上传 → 服务端逐块复算校验 → 整文件复算 → 页面显示「✓ 已验证 · 字节完全一致」。
-- **预览**：资料库是缩略图网格——照片直接出缩略、视频出首帧（滚到可见才加载，最多 4 个并发）。点卡片打开灯箱看大图 / 播放视频（`Esc` 关闭、`←` `→` 切换、视频可拖进度条）。预览走 `/api/preview` 读原始字节，**不生成也不保存缩略图**，所以预览永远不会改动原文件。
+- **预览**：资料库是缩略图网格——照片直接出缩略、视频出首帧（滚到可见才加载，最多 4 个并发）。缩略图优先用**相机写在 EXIF 里的那段缩略图**（`/api/thumb`，通常 10–30 KB，一屏 10 MB 原图也只花几十 KB）；这段缩略图本身不带 EXIF，所以网格按主文件的 `Orientation` 自行旋转，竖拍照片不会躺倒。没有内嵌缩略图时退回读原文件头部，再不行才整份读取（超过 8 MiB 的图不整份拉取，卡片显示「点开查看」）。点卡片打开灯箱看大图 / 播放视频（`Esc` 关闭、`←` `→` 切换、视频可拖进度条）：大图加载期间先放大模糊显示已有缩略图，并在底部显示「载入 N%」。预览全部只读原文件字节，**不生成也不保存任何派生图**，所以预览永远不会改动原文件。
 - **下载**：在「资料库」点单张卡片的「下载」，或勾选多张后点「下载选中（N）」，浏览器逐块 GET、逐块用 JS 校验、再整文件校验，一致才保存到本地。多选是逐个下载，每一项都独立做 SHA-256 校验。
 - **浏览器认不出的格式**：CR3、NEF 等 RAW 只显示文件图标（`/api/preview` 返回 `415`），照常可以下载校验；HEIC/HEIF 能否显示取决于浏览器。
 - **断点续传**：上传到一半中断（关页面 / 断网），重新选同一个文件，`POST /api/upload/init` 会返回 `next_index`，浏览器只补未验的块。
-- **列表 / 删除**：资料库列出服务端 `received/` 里的文件，可删除。
+- **列表 / 删除**：资料库列出服务端 `shared/` 里的文件，可删除（CLI 的 `receive` 子命令写的是 `received/`，两者互不干扰）。
 
 ### 跨网络 / 不同局域网：用 SakuraFrp（或任意 frp）TCP 隧道
 
@@ -255,9 +258,10 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`（开放模式为 `false`）、`tls`、`media_token`（预览专用，开放模式为空）、`preview_ext`（可预览的图片 / 视频扩展名） |
+| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`（开放模式为 `false`）、`tls`、`media_token`（预览专用，开放模式为空）、`preview_ext`（可预览的图片 / 视频扩展名）、`thumb_ext`（可走 `/api/thumb` 取内嵌缩略图的扩展名） |
 | GET | `/api/list` | 列出资料库文件（name / size / mtime_ns / kind=`image`\|`video`\|`other`） |
 | GET | `/api/preview?name=&index=` | **只读预览**：返回原文件原始字节（不解码、不转码），按扩展名给 `Content-Type`，支持 `Range`（`206` + `Accept-Ranges`，视频可拖进度）；未知 / 浏览器不认的格式（CR3、NEF、RAW…）→ `415`。`index` 可选，仅作客户端缓存键 |
+| GET | `/api/thumb?name=` | **内嵌缩略图**：从 JPEG 的 EXIF IFD1 里切出相机自己写入的那段缩略图（不生成、不重编码、不落盘），带 `ETag` + 7 天缓存，命中条件请求返回 `304`；响应头 `X-Thumb-Orientation` 给出主文件的 EXIF 方向（1–8），因为这段缩略图本身不带 EXIF，前端要据此旋转；文件没带缩略图 → `415`（此时前端退回 `/api/preview`，**不代表**该文件不能预览） |
 | POST | `/api/upload/init` | 提交清单；返回 `status=upload` + `next_index`（或 `complete` 幂等跳过） |
 | POST | `/api/upload/chunk?name=&index=` | 上传一块原始字节，服务端逐块校验 SHA-256 |
 | POST | `/api/upload/complete` | 整文件复算 → 原子发布 → 恢复元数据 |
