@@ -14,6 +14,7 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var token = sessionStorage.getItem('lt_token') || '';
+  var tokenRequired = true;
   var serverChunk = 0;
   var busy = false;
 
@@ -63,29 +64,59 @@
 
   // ---- connection ---------------------------------------------------------
   async function connect() {
-    token = $('token').value.trim() || token;
-    if (!token) { log('请先输入 ACCESS TOKEN', 'err'); return; }
-    $('connectBtn').disabled = true;
+    token = (($('token') && $('token').value.trim()) || token);
+    var info;
     try {
-      var info = (await api('/api/info')).body;
+      info = (await api('/api/info')).body;
       serverChunk = info.chunk_size;
+      tokenRequired = info.token_required !== false;
+    } catch (e) {
+      // 401 means the server does require a token: show the input and stop.
+      if (e.status === 401) {
+        showTokenInput();
+        log('需要 ACCESS TOKEN：请输入服务端启动时打印的令牌。', 'err');
+        return;
+      }
+      $('connBadge').className = 'badge badge-off';
+      $('connBadge').textContent = '未连接';
+      log('连接失败：' + e.message, 'err');
+      return;
+    }
+    if (tokenRequired) {
+      if (!token) { showTokenInput(); log('请先输入 ACCESS TOKEN', 'err'); return; }
       sessionStorage.setItem('lt_token', token);
+    } else {
+      // Open mode: nothing to type, so hide the connection card entirely.
+      hideTokenInput();
+    }
+    try {
       $('connBadge').className = 'badge badge-on';
       $('connBadge').textContent = '已连接 v' + info.version;
       $('connInfo').innerHTML =
         '服务：<b>' + info.service + ' ' + info.version + '</b><br>' +
         '分块大小：<b>' + fmtSize(info.chunk_size) + '</b>（' + info.chunk_size + ' 字节）<br>' +
-        '鉴权：<b>X-LT-Token</b>　协议版本：<b>' + info.protocol + '</b>';
+        '鉴权：<b>' + (tokenRequired ? 'X-LT-Token' : '开放模式（无需令牌）') + '</b>　' +
+        '协议版本：<b>' + info.protocol + '</b>';
       $('workspace').classList.remove('hidden');
       log('连接成功，服务端 chunk_size=' + serverChunk, 'ok');
+      if (!tokenRequired) log('该共享文件夹为开放模式：任何人打开此地址均可上传/下载/删除。', 'warn');
       await refresh();
     } catch (e) {
-      $('connBadge').className = 'badge badge-off';
-      $('connBadge').textContent = '未连接';
       log('连接失败：' + e.message, 'err');
-    } finally {
-      $('connectBtn').disabled = false;
     }
+  }
+
+  function showTokenInput() {
+    var card = $('connCard'), row = $('tokenRow'), hint = $('connHint');
+    if (card) card.classList.remove('hidden');
+    if (row) row.classList.remove('hidden');
+    if (hint) hint.classList.remove('hidden');
+  }
+
+  function hideTokenInput() {
+    var row = $('tokenRow'), hint = $('connHint');
+    if (row) row.classList.add('hidden');
+    if (hint) hint.classList.add('hidden');
   }
 
   // ---- hashing helpers ----------------------------------------------------
@@ -329,8 +360,7 @@
   $('connectBtn').onclick = connect;
   $('token').addEventListener('keydown', function (e) {
     if (e.key === 'Enter') connect();
-  });
-  $('refreshBtn').onclick = refresh;
+  });  $('refreshBtn').onclick = refresh;
   $('fileInput').onchange = function (e) {
     uploadFiles(Array.prototype.slice.call(e.target.files));
     e.target.value = '';
@@ -348,6 +378,8 @@
   window.addEventListener('dragover', function (e) { e.preventDefault(); });
   window.addEventListener('drop', function (e) { e.preventDefault(); });
 
-  log('页面就绪。' + (token ? '已恢复令牌，点击「连接」即可。' : '请输入 ACCESS TOKEN。'), '');
-  if (token) connect();
+  // Bootstrap: always probe /api/info. In open mode this connects with no
+  // input at all; in token mode a 401 triggers the token form instead.
+  log('页面就绪，正在连接…', '');
+  connect();
 })();

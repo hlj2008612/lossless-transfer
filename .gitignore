@@ -25,6 +25,9 @@ received/
 verify_output/
 *.log
 
+# The shared folder is live data (photos/videos), not source
+shared/
+
 # Self-signed TLS certificates (contain a PRIVATE KEY - never commit these)
 *.pem
 *.key

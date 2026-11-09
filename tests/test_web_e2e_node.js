@@ -148,11 +148,17 @@ async function waitReady(url, child, timeoutMs) {
     console.log('browser-path e2e against ' + url);
 
     // ---- info / auth ----
-    let bad = 0;
-    try { await api(url, '/api/info', { headers: { 'X-LT-Token': 'wrong' } }); }
-    catch (e) { bad = 1; }
-    ok(bad === 1, 'wrong token is rejected');
     const info = (await api(url, '/api/info')).body;
+    if (info.token_required === false) {
+      // Open mode (--no-auth): by design EVERY request is accepted, so there
+      // is no "wrong token is rejected" assertion to make here.
+      console.log('  -- open mode (token_required=false): token checks skipped');
+    } else {
+      let bad = 0;
+      try { await api(url, '/api/info', { headers: { 'X-LT-Token': 'wrong' } }); }
+      catch (e) { bad = 1; }
+      ok(bad === 1, 'wrong token is rejected');
+    }
     ok(info.chunk_size > 0, 'server advertises chunk_size=' + info.chunk_size);
     const cs = info.chunk_size;
 

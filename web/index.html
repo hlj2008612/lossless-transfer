@@ -18,11 +18,11 @@
   <div id="connBadge" class="badge badge-off">未连接</div>
 </header>
 
-<!-- connection / token -->
+<!-- connection / token (hidden automatically in --no-auth open mode) -->
 <section class="card" id="connCard">
   <h2>① 连接</h2>
-  <p class="hint">输入服务端启动时打印的 <b>ACCESS TOKEN</b>（会作为 <code>X-LT-Token</code> 头发送）。跨网络时把浏览器地址换成 SakuraFrp 隧道给出的公网地址即可。</p>
-  <div class="row">
+  <p id="connHint" class="hint">输入服务端启动时打印的 <b>ACCESS TOKEN</b>（会作为 <code>X-LT-Token</code> 头发送）。跨网络时把浏览器地址换成 SakuraFrp 隧道给出的公网地址即可。</p>
+  <div class="row" id="tokenRow">
     <input type="password" id="token" placeholder="ACCESS TOKEN" autocomplete="off" spellcheck="false">
     <button id="connectBtn" class="btn primary">连接</button>
   </div>

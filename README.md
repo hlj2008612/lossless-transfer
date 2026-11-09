@@ -80,7 +80,7 @@
 ├── .gitignore
 ├── tests/
 │   ├── test_lossless_transfer.py   # 11 个 unittest：CLI 真实 TCP 端到端
-│   ├── test_web_transfer.py        # 12 个 unittest：网页 HTTP/HTTPS API 端到端
+│   ├── test_web_transfer.py        # 15 个 unittest：网页 HTTP/HTTPS/开放模式 API 端到端
 │   ├── test_sha256_js.js           # 纯 JS SHA-256 对拍 Node crypto（51 cases）
 │   ├── test_web_e2e_node.js        # 浏览器真实代码路径 e2e（支持 HTTPS 隧道）
 │   └── fixtures/                   # 公开的一次性测试用自签证书（非真实凭据）
@@ -151,8 +151,23 @@ Windows 上直接用 `py -3 scripts/verify_transfer.py`（脚本用 `sys.executa
 
 CLI 适合命令行；如果想**在网页里拖拽上传、点击下载**，或两台机器**不在同一个局域网**（家里 ↔ 公司、手机 ↔ 家里电脑），用网页版。它仍然是**零第三方依赖**：服务端 `web_transfer.py`（Python 标准库 `http.server`），前端是 `web/` 下四个纯静态文件（含一个纯 JS 实现的 SHA-256）。
 
-### 本机 / 局域网快速体验
+### 共享文件夹模式（打开域名即用，无需令牌）
 
+如果你想要的是「**对方打开域名就能直接上传/下载，什么都不用填**」，用开放模式把一个专用文件夹当共享盘：
+
+```powershell
+pwsh -NoProfile -File .\scripts\start_web.ps1 -Open -Dir shared
+```
+
+或直接用 `python3 web_transfer.py --no-auth --dir ./shared ...`。此时：
+
+- 页面**自动连接**，连接卡片隐藏，打开就是上传区和资料库；
+- `--dir` 指向的文件夹（默认的 `shared/`）就是网页里的共享文件夹，对方能**上传 / 下载 / 删除**；
+- `/api/info` 返回 `"token_required": false`。
+
+> ⚠️ **开放模式 = 没有门锁**：任何知道公网地址的人都能往这个文件夹写东西、下载里面的文件、甚至删除。只在你清楚风险时使用（例如临时给家人传照片、用完就停）。`--no-auth` 与 `--token` 不能同时给。
+
+### 本机 / 局域网快速体验
 **接收端（跑服务端，先启动）**
 ```bash
 python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./received --token 你自己的口令
@@ -237,7 +252,7 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`、`tls` |
+| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`（开放模式为 `false`）、`tls` |
 | GET | `/api/list` | 列出资料库文件（name / size / mtime_ns） |
 | POST | `/api/upload/init` | 提交清单；返回 `status=upload` + `next_index`（或 `complete` 幂等跳过） |
 | POST | `/api/upload/chunk?name=&index=` | 上传一块原始字节，服务端逐块校验 SHA-256 |
@@ -249,7 +264,7 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 ### 网页版测试
 
 ```bash
-python3 -m unittest discover -s tests -v      # 23 个测试（11 CLI + 12 网页 HTTP/HTTPS API）
+python3 -m unittest discover -s tests -v      # 26 个测试（11 CLI + 15 网页 HTTP/HTTPS/开放模式 API）
 node tests/test_sha256_js.js                   # 纯 JS SHA-256 对拍 Node crypto：51 cases
 node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e：约 135 checks（随分块数/幂等跳过浮动）
 ```

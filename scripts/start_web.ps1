@@ -34,6 +34,8 @@ param(
     [int]      $Port           = 8765,
     [string]   $Dir            = 'received',
     [string]   $Token          = '',
+    # Open mode: no token. Anyone who reaches the URL can upload/download/delete.
+    [switch]   $Open,
     [string[]] $DnsNames       = @('localhost', '127.0.0.1', 'frp-ski.com',
                                     'dx.frp-ski.com', 'yd.frp-ski.com'),
     [int]      $ChunkSize      = 4194304,
@@ -71,6 +73,7 @@ $pyArgs = @('-3', (Join-Path $root 'web_transfer.py'),
             '--tls-cert', $certPath,
             '--tls-key',  $keyPath)
 if ($Token) { $pyArgs += @('--token', $Token) }
+if ($Open)  { $pyArgs += @('--no-auth') }
 
 $py = if ($env:PYTHON_EXE) { $env:PYTHON_EXE } else { 'py' }
 
@@ -81,7 +84,11 @@ Write-Host ''
 Write-Host ('    SakuraFrp TCP tunnel: local 127.0.0.1:' + $Port +
             ' , Auto HTTPS = DISABLED') -ForegroundColor Yellow
 Write-Host '    Browser (other network): https://<公网地址>  (accept the self-signed cert once)' -ForegroundColor Yellow
-Write-Host '    Enter the ACCESS TOKEN printed below into the web page.' -ForegroundColor Yellow
+if ($Open) {
+    Write-Host '    OPEN MODE: no token - anyone who opens the URL can upload/download/DELETE.' -ForegroundColor Red
+} else {
+    Write-Host '    Enter the ACCESS TOKEN printed below into the web page.' -ForegroundColor Yellow
+}
 Write-Host ''
 Write-Host '    Press Ctrl+C to stop.' -ForegroundColor DarkGray
 Write-Host ''

@@ -211,6 +211,10 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(400, "invalid JSON body")
 
     def _require_auth(self) -> None:
+        # An empty token means --no-auth: the shared folder is deliberately
+        # open to anyone who can reach the URL (see README "open mode").
+        if not self.cfg.token:
+            return
         got = self.headers.get("X-LT-Token", "")
         if not got or not hmac.compare_digest(got, self.cfg.token):
             raise HTTPError(401, "unauthorized: invalid or missing X-LT-Token")
@@ -278,7 +282,7 @@ class Handler(BaseHTTPRequestHandler):
             "version": WEB_VERSION,
             "protocol": lt.PROTOCOL_VERSION,
             "chunk_size": self.cfg.chunk_size,
-            "token_required": True,
+            "token_required": bool(self.cfg.token),
             "tls": isinstance(self.server.socket, ssl.SSLSocket),
         })
 
@@ -505,6 +509,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
     p.add_argument("--token", default=None,
                    help="access token; a random one is generated if omitted")
+    p.add_argument("--no-auth", action="store_true",
+                   help="open mode: no token at all, anyone who can reach the "
+                        "URL may upload/download/delete (implies a public folder)")
     p.add_argument("--tls-cert", default=None,
                    help="PEM certificate to serve HTTPS (needed for mainland "
                         "SakuraFrp nodes that block plain HTTP); use with --tls-key")
@@ -534,7 +541,11 @@ def main(argv: Optional[list] = None) -> int:
         print("ERROR: --tls-cert and --tls-key must be used together",
               file=sys.stderr)
         return 2
-    token = args.token or secrets.token_urlsafe(18)
+    if args.no_auth and args.token:
+        print("ERROR: --no-auth and --token are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    token = "" if args.no_auth else (args.token or secrets.token_urlsafe(18))
     cfg = Config(args.host, args.port, args.dir, args.chunk_size, token)
     cfg.ensure_dirs()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
@@ -559,8 +570,14 @@ def main(argv: Optional[list] = None) -> int:
     print("  Chunk size   : %d bytes (%.1f MiB)" %
           (cfg.chunk_size, cfg.chunk_size / 1048576.0))
     print("  Local URL    : %s://%s:%d" % (scheme, shown_host, args.port))
-    print("  ACCESS TOKEN : %s" % token)
-    print("  -> enter this token in the web page (sent as X-LT-Token header)")
+    if token:
+        print("  ACCESS TOKEN : %s" % token)
+        print("  -> enter this token in the web page (sent as X-LT-Token header)")
+    else:
+        print("  ACCESS TOKEN : (open mode - no token required)")
+        print("  -> WARNING: ANYONE who can reach this URL can upload, download "
+              "and DELETE")
+        print("     files in the shared folder. Only use this knowingly.")
     print("  -> other networks: point a SakuraFrp/frp TCP tunnel at port %d,"
           % args.port)
     print("     then open the public %s://<tunnel-host>:<port> in a browser"

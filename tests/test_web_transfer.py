@@ -462,5 +462,76 @@ class WebTransferTLS(unittest.TestCase):
         self.assertIsInstance(ctx, ssl.SSLContext)
 
 
+class WebTransferOpenMode(unittest.TestCase):
+    """--no-auth: an empty token means every request is accepted on purpose."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.mkdtemp(prefix="lt-web-open-")
+        cls.lib = os.path.join(cls.tmp, "shared")
+        cls.cfg = wt.Config("127.0.0.1", 0, cls.lib, CHUNK_SIZE, "")
+        cls.cfg.ensure_dirs()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), wt.Handler)
+        cls.httpd.daemon_threads = True
+        cls.httpd.cfg = cls.cfg
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=5)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def req(self, method: str, path: str, body: bytes | None = None,
+            headers: dict | None = None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse()
+        data = resp.read()
+        status = resp.status
+        conn.close()
+        return status, data
+
+    def test_12_open_mode_needs_no_token(self):
+        st, body = self.req("GET", "/api/info")
+        self.assertEqual(st, 200)
+        info = json.loads(body.decode("utf-8"))
+        self.assertFalse(info["token_required"],
+                         "open mode must advertise token_required=false")
+
+    def test_13_open_mode_full_roundtrip_without_token(self):
+        data = os.urandom(CHUNK_SIZE * 2 + 37)
+        m = browser_manifest("open.bin", data)
+        body = json.dumps(m, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+        st, b = self.req("POST", "/api/upload/init", body,
+                         {"Content-Type": "application/json"})
+        self.assertEqual(st, 200, "no token required, body=%r" % b[:300])
+        init = json.loads(b.decode("utf-8"))
+        self.assertEqual(init["status"], "upload")
+        for c in m["chunks"]:
+            raw = data[c["offset"]:c["offset"] + c["length"]]
+            st, b = self.req("POST", "/api/upload/chunk?name=open.bin&index=%d"
+                             % c["index"], raw,
+                             {"Content-Type": "application/octet-stream"})
+            self.assertEqual(st, 200, "chunk %d: %r" % (c["index"], b[:200]))
+        done = json.dumps({"name": "open.bin",
+                           "mtime_ns": MTIME_NS}).encode("utf-8")
+        st, b = self.req("POST", "/api/upload/complete", done,
+                         {"Content-Type": "application/json"})
+        self.assertEqual(st, 200, b[:300])
+        self.assertEqual(json.loads(b.decode("utf-8"))["status"], "verified")
+        with open(os.path.join(self.lib, "open.bin"), "rb") as f:
+            self.assertEqual(f.read(), data, "open mode stays byte-exact")
+
+    def test_14_no_auth_and_token_are_exclusive(self):
+        self.assertEqual(wt.main(["--no-auth", "--token", "x", "--port",
+                                  "0", "--dir", self.lib]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
