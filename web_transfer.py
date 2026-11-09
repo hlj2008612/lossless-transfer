@@ -41,16 +41,19 @@ import sys
 import threading
 import traceback
 import urllib.parse
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import lossless_transfer as lt
 
-WEB_VERSION = "1.1.0"
+WEB_VERSION = "1.2.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
 MAX_INIT_BODY = 64 << 20
 MAX_SMALL_BODY = 1 << 20
+PREVIEW_CHUNK = 1 << 20             # rolling read size for streamed responses
+PREVIEW_BATCH = 2 << 20             # a small mid-file Range is served in one piece
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 STATIC_TYPES = {
     "index.html": "text/html; charset=utf-8",
@@ -59,6 +62,28 @@ STATIC_TYPES = {
     "sha256.js": "application/javascript; charset=utf-8",
 }
 INTERNAL_SUFFIXES = (lt.RECV_SUFFIX, lt.STATE_SUFFIX, lt.MANIFEST_SUFFIX)
+
+# Browser-displayable media, by extension (case-insensitive). Anything that a
+# browser cannot natively decode (CR3/NEF/ARW/HEIC/HEVC .mp4/MOV ...) is
+# "other": its bytes are still downloadable byte-exactly, but not previewed.
+IMAGE_TYPES = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".jpe": "image/jpeg",
+    ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
+    ".avif": "image/avif", ".bmp": "image/bmp",
+}
+VIDEO_TYPES = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4",
+    ".webm": "video/webm", ".ogv": "video/ogg", ".ogg": "video/ogg",
+    ".mov": "video/quicktime",
+}
+OTHER_TYPES = {
+    ".txt": "text/plain; charset=utf-8",
+    ".json": "application/json",
+    ".pdf": "application/pdf",
+}
+# Kept exact: a browser can display these only if it happens to support HEIC
+# (Safari); everyone else falls back to the download button.
+OTHER_TYPES.update({".heic": "image/heic", ".heif": "image/heif"})
 
 
 class HTTPError(Exception):
@@ -113,6 +138,22 @@ def safe_name(name: Any) -> str:
     return name
 
 
+def media_type(name: str) -> Tuple[str, Optional[str]]:
+    """Map a file name to (kind, content_type) strictly from its extension.
+
+    kind is "image" or "video" for formats every current browser renders
+    natively; anything else is "other" (content_type None), so the preview
+    endpoint can answer 415 instead of handing the browser bytes it would
+    merely download.
+    """
+    ext = os.path.splitext(name)[1].lower()
+    if ext in IMAGE_TYPES:
+        return "image", IMAGE_TYPES[ext]
+    if ext in VIDEO_TYPES:
+        return "video", VIDEO_TYPES[ext]
+    return "other", None
+
+
 def validate_manifest(obj: Any, cfg: Config) -> Dict[str, Any]:
     """Validate the browser-supplied manifest before trusting any of it."""
     if not isinstance(obj, dict):
@@ -158,7 +199,11 @@ def validate_manifest(obj: Any, cfg: Config) -> Dict[str, Any]:
 
 
 class Handler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.0"  # one request per connection: simple & robust
+    # HTTP/1.0: one request per connection, so every response ends with EOF.
+    # Range/Accept-Ranges still work (a 206 carries an exact Content-Length);
+    # the UI's preview loader reads responses with a byte bound so a shared
+    # protocol_version change can never stall it.
+    protocol_version = "HTTP/1.0"
     server_version = "LosslessWeb/" + WEB_VERSION
 
     @property
@@ -168,6 +213,9 @@ class Handler(BaseHTTPRequestHandler):
     # ---- low-level helpers -------------------------------------------------
     def _send_bytes(self, data: bytes, content_type: str, status: int = 200,
                     extra: Optional[Dict[str, str]] = None) -> None:
+        # Bytes this response body will contain. _api_preview consults it so a
+        # HEAD request answers with identical headers and no body.
+        self._body_bytes = len(data)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
@@ -176,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
             for k, v in extra.items():
                 self.send_header(k, v)
         self.end_headers()
-        if data:
+        if data and self.command != "HEAD":
             try:
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):
@@ -210,11 +258,20 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             raise HTTPError(400, "invalid JSON body")
 
-    def _require_auth(self) -> None:
+    def _require_auth(self, allow_media_token: bool = False) -> None:
         # An empty token means --no-auth: the shared folder is deliberately
         # open to anyone who can reach the URL (see README "open mode").
         if not self.cfg.token:
             return
+        if allow_media_token:
+            # <video>/<img> cannot send request headers, so the preview
+            # endpoint additionally accepts the server-generated media token
+            # in the query string. It is unused on every other route, so it
+            # can never unlock a mutation or a verified download.
+            mt = getattr(self.server, "media_token", "")
+            got_t = self._parts()[1].get("t", [""])[0]
+            if mt and got_t and hmac.compare_digest(got_t, mt):
+                return
         got = self.headers.get("X-LT-Token", "")
         if not got or not hmac.compare_digest(got, self.cfg.token):
             raise HTTPError(401, "unauthorized: invalid or missing X-LT-Token")
@@ -234,6 +291,69 @@ class Handler(BaseHTTPRequestHandler):
     def _staging_for(self, name: str):
         key = hashlib.sha256(name.encode("utf-8")).hexdigest()
         return os.path.join(self.cfg.staging, key), key
+
+    # ---- range / streaming helpers -----------------------------------------
+    def _parse_range(self, size: int) -> Optional[Tuple[Optional[int],
+                                                        Optional[int]]]:
+        """Parse the single byte-range of a `Range: bytes=...` header.
+
+        Returns (start, end) with BOTH inclusive (None, None) means "whole
+        file", or None when the header is unsatisfiable (RFC 9110 416).
+        Multi-range requests are deliberately not multiplexed: the first
+        satisfiable range is served, which is legal (a server may ignore the
+        others) and keeps `<video>` seeking trivially correct.
+        """
+        raw = (self.headers.get("Range") or "").strip()
+        if not raw.lower().startswith("bytes="):
+            return (None, None)
+        for part in raw[6:].split(","):
+            part = part.strip()
+            if "-" not in part:
+                continue
+            first, last = part.split("-", 1)
+            first, last = first.strip(), last.strip()
+            try:
+                if not first:                       # suffix: bytes=-N
+                    n = int(last)
+                    if n <= 0 or size <= 0:
+                        continue
+                    return max(0, size - n), size - 1
+                start = int(first)                  # bytes=A- / bytes=A-B
+                if start < 0 or start >= size:
+                    continue
+                end = int(last) if last else size - 1
+                if end < start:
+                    continue
+                return start, min(end, size - 1)
+            except ValueError:
+                continue
+        return None
+
+    def _stream_file(self, path: str, start: int, length: int) -> None:
+        """Copy exactly `length` raw bytes from `path[start:]` to the socket.
+
+        The bytes are never decoded or transformed; the file is read in
+        PREVIEW_CHUNK pieces (a last-second file replacement merely ends the
+        stream early, it can never inject wrong bytes into a verified
+        download, which always goes through /api/download/chunk).
+        """
+        pos = start
+        remaining = length
+        try:
+            with open(path, "rb") as f:
+                if start:
+                    f.seek(start)
+                while remaining > 0:
+                    f.seek(pos)  # tolerate a concurrent overwrite
+                    piece = f.read(min(PREVIEW_CHUNK, remaining))
+                    if not piece:
+                        break
+                    self.wfile.write(piece)
+                    pos += len(piece)
+                    remaining -= len(piece)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     # ---- routing -----------------------------------------------------------
     def _serve_static(self, path: str) -> None:
@@ -256,7 +376,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return self._serve_static(path)
             raise HTTPError(404, "not found")
-        self._require_auth()
+        # /api/preview is the ONLY route that also accepts the media token,
+        # because a browser media element cannot attach request headers.
+        self._require_auth(allow_media_token=(path == "/api/preview"))
         if path == "/api/info" and method == "GET":
             return self._api_info()
         if path == "/api/list" and method == "GET":
@@ -271,6 +393,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_download_manifest(q)
         if path == "/api/download/chunk" and method == "GET":
             return self._api_download_chunk(q)
+        if path == "/api/preview" and method == "GET":
+            return self._api_preview(q)
         if path == "/api/delete" and method == "POST":
             return self._api_delete()
         raise HTTPError(404, "unknown endpoint")
@@ -284,6 +408,13 @@ class Handler(BaseHTTPRequestHandler):
             "chunk_size": self.cfg.chunk_size,
             "token_required": bool(self.cfg.token),
             "tls": isinstance(self.server.socket, ssl.SSLSocket),
+            # Header-less media elements (<video> posters/playback) append
+            # this to the preview URL instead of X-LT-Token. Empty in
+            # --no-auth mode, where no token is needed at all.
+            "media_token": getattr(self.server, "media_token", "")
+                           if self.cfg.token else "",
+            "preview_ext": {"image": sorted(IMAGE_TYPES),
+                            "video": sorted(VIDEO_TYPES)},
         })
 
     def _api_list(self) -> None:
@@ -298,8 +429,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             st = os.stat(path)
             mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+            kind, _ = media_type(name)
             files.append({"name": name, "size": st.st_size,
-                          "mtime_ns": mtime_ns})
+                          "mtime_ns": mtime_ns, "kind": kind})
         self._send_json({"files": files, "count": len(files)})
 
     # ---- API: upload -------------------------------------------------------
@@ -448,6 +580,75 @@ class Handler(BaseHTTPRequestHandler):
             "X-Chunk-Sha256": hashlib.sha256(data).hexdigest(),
         })
 
+    # ---- API: preview ------------------------------------------------------
+    def _api_preview(self, q) -> None:
+        """GET /api/preview?name=... [&index=N]  -> raw bytes, Range-aware.
+
+        Streams the stored file verbatim with the Content-Type implied by its
+        extension, so the browser can render images and play/seek videos. It
+        is a *display* path: the verified, SHA-256-checked path stays
+        /api/download/manifest + /api/download/chunk.
+
+        `index` is OPTIONAL: a caller-visible hint that the client wants the
+        N-th previewable item of its current list. It is validated (integer)
+        but never selects a file - `name` alone does - so the endpoint cannot
+        be used to probe anything outside the shared folder.
+
+        Headers: Accept-Ranges / Content-Range / ETag / Last-Modified, so
+        <video> can seek with 206 responses and images can be cached briefly.
+        Extensions a browser cannot decode natively (CR3/NEF/RAW ...) get 415
+        so the UI offers the verified download instead.
+        """
+        name = safe_name(self._qs(q, "name"))
+        if "index" in q:
+            try:
+                int(self._qs(q, "index"))
+            except ValueError:
+                raise HTTPError(400, "index must be an integer")
+        kind, ctype = media_type(name)
+        if ctype is None:
+            raise HTTPError(415, "this file type cannot be previewed in a "
+                                 "browser; download it to verify it "
+                                 "byte-exactly")
+        dest = os.path.join(self.cfg.dir, name)
+        if not os.path.isfile(dest):
+            raise HTTPError(404, "file not found")
+        st = os.stat(dest)
+        size = st.st_size
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+        # (size, mtime_ns) identifies the stored version: a client may pass
+        # it as `index=` so a re-uploaded name becomes a new URL and the
+        # browser cache can never serve stale bytes.
+        etag = '"%x-%x"' % (size, mtime_ns)
+        rng = self._parse_range(size)
+        if rng is None:
+            self._send_bytes(
+                b'{"error":"requested range not satisfiable"}',
+                "application/json; charset=utf-8", 416,
+                {"Content-Range": "bytes */%d" % size})
+            return
+        start = 0 if rng[0] is None else int(rng[0])
+        end = (size - 1) if rng[1] is None else int(rng[1])
+        length = end - start + 1 if size > 0 else 0
+        partial = rng[0] is not None
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Disposition", "inline")
+        # Short max-age: bytes are immutable for a given ETag, and it keeps
+        # video seeking / repeated image opens off a slow tunnel.
+        self.send_header("Cache-Control", "private, max-age=86400")
+        if partial:
+            self.send_header("Content-Range",
+                             "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        if length and self.command != "HEAD":
+            self._stream_file(dest, start, length)
+
     # ---- API: delete -------------------------------------------------------
     def _api_delete(self) -> None:
         body = self._read_json(MAX_SMALL_BODY)
@@ -470,7 +671,9 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("POST")
 
     def do_HEAD(self) -> None:
-        self._send_bytes(b"", "text/plain; charset=utf-8", 200)
+        # Routed like GET so HEAD /api/preview (and the rest of /api/*)
+        # reports the same headers a GET would; bodies are suppressed.
+        self._handle("GET")
 
     def _handle(self, method: str) -> None:
         try:
@@ -551,6 +754,10 @@ def main(argv: Optional[list] = None) -> int:
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
     httpd.cfg = cfg  # type: ignore[attr-defined]
+    # Media elements (<video>) cannot send X-LT-Token, so the preview endpoint
+    # also honours `?t=<token>` - one expiring, tunnel-scoped secret, never
+    # part of a verified download. See Handler._require_auth.
+    httpd.media_token = secrets.token_urlsafe(9)  # type: ignore[attr-defined]
     tls = False
     if args.tls_cert:
         try:

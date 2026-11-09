@@ -56,11 +56,12 @@
 | `http.server.ThreadingHTTPServer` | 标准库自带，纯 Python，无需 Flask/FastAPI/nginx |
 | 纯静态前端（`web/` 三个文件） | 无需构建工具；浏览器原生 `fetch` / `Blob.slice().arrayBuffer()` 即可分块读原始字节 |
 | **自写纯 JS SHA-256** (`web/sha256.js`) | 普通 TCP 隧道 / 局域网常是明文 HTTP，属于**非安全上下文**，`window.crypto.subtle` 会被浏览器禁用；因此自带增量式 SHA-256，且避免把整个视频读进内存。开启 HTTPS 后浏览器原生 `crypto.subtle` 也可用，但本项目仍统一用自带实现，行为一致 |
-| 令牌鉴权 `X-LT-Token` | 隧道把端口暴露到公网，必须有一道口令（`hmac.compare_digest` 常量时间比对）；比 CLI 的「无认证」更进一步 |
+| 令牌鉴权 `X-LT-Token` | 隧道把端口暴露到公网，必须有一道口令（`hmac.compare_digest` 常量时间比对）；比 CLI 的「无认证」更进一步。`/api/preview` 额外接受只读的 `media_token`（查询参数 `t=`），因为 `<video>`/`<img>` 发不了自定义请求头；它不能调用任何其他接口 |
+| 预览 = 原文件原字节 | 缩略图与大图都直接读取原文件字节交给浏览器解码，服务端不生成、不缓存、不落盘任何派生图像（派生图一旦保存，就有被当成「原图」拿走的隐患）；视频用 `Range` 分段流式读取，拖进度条不会整段下载 |
 | **原生 HTTPS**（可选 `--tls-cert/--tls-key`） | 标准库 `ssl.SSLContext` 直接把监听 socket 包成 TLS；内地 SakuraFrp 节点按合规要求拦截明文 HTTP（返回 501），但放行 TLS 字节流，因此跨公网必须让链路是 HTTPS。配套 `scripts/gen_cert.ps1` 零依赖生成自签证书 |
 | 大分块（默认 4 MiB） | 隧道上往返延迟更高，加大块减少请求数 |
 
-**未实现（明确的边界，非缺陷）**：CLI 传输层**无加密、无身份认证**（明文 TCP，仅建议可信局域网 / 本机，公网请套 SSH 隧道、WireGuard 或 TLS 反向代理）。网页版增加了**令牌鉴权**；不开 `--tls-cert` 时仍是**明文 HTTP**（仅建议本机 / 可信局域网），开 HTTPS 后令牌与文件字节在链路上加密（自签证书仅提供加密与主机校验，不提供公信力，首次访问浏览器会提示一次）。协议不含 NAT 穿透（由 frp 等外部工具解决）、不含多文件批量（可逐个选 / 脚本循环）、不含目录递归。
+**未实现（明确的边界，非缺陷）**：CLI 传输层**无加密、无身份认证**（明文 TCP，仅建议可信局域网 / 本机，公网请套 SSH 隧道、WireGuard 或 TLS 反向代理）。网页版增加了**令牌鉴权**；不开 `--tls-cert` 时仍是**明文 HTTP**（仅建议本机 / 可信局域网），开 HTTPS 后令牌与文件字节在链路上加密（自签证书仅提供加密与主机校验，不提供公信力，首次访问浏览器会提示一次）。协议不含 NAT 穿透（由 frp 等外部工具解决）、不含目录递归（网页版可多选后逐个下载并逐项校验）。
 
 ---
 
@@ -175,7 +176,7 @@ python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./received --token 你�
 Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一个**并打印在启动日志里。加 `--tls-cert`/`--tls-key` 则改为原生 HTTPS（跨公网 / 内地节点必需，见下一节）。启动后终端会打印类似：
 
 ```
-  lossless-transfer  WEB  v1.1.0   (Python stdlib only)
+  lossless-transfer  WEB  v1.2.0   (Python stdlib only)
   Library dir  : D:\...\无损传输\received
   Chunk size   : 4194304 bytes (4.0 MiB)
   Local URL    : http://127.0.0.1:8765     # 加了证书则是 https://
@@ -187,7 +188,9 @@ Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一�
 **发送端（任何有浏览器的设备）**：打开 `http://<接收端IP>:8765` → 在「连接」卡片填入上面的 `ACCESS TOKEN` → 点「连接」。之后：
 
 - **上传**：把照片 / 视频拖进虚线框（或点「选择文件」，可多选）。浏览器先用纯 JS 逐块算 SHA-256 → 分块上传 → 服务端逐块复算校验 → 整文件复算 → 页面显示「✓ 已验证 · 字节完全一致」。
-- **下载**：在「资料库」点「下载并校验」，浏览器逐块 GET、逐块用 JS 校验、再整文件校验，一致才保存到本地。
+- **预览**：资料库是缩略图网格——照片直接出缩略、视频出首帧（滚到可见才加载，最多 4 个并发）。点卡片打开灯箱看大图 / 播放视频（`Esc` 关闭、`←` `→` 切换、视频可拖进度条）。预览走 `/api/preview` 读原始字节，**不生成也不保存缩略图**，所以预览永远不会改动原文件。
+- **下载**：在「资料库」点单张卡片的「下载」，或勾选多张后点「下载选中（N）」，浏览器逐块 GET、逐块用 JS 校验、再整文件校验，一致才保存到本地。多选是逐个下载，每一项都独立做 SHA-256 校验。
+- **浏览器认不出的格式**：CR3、NEF 等 RAW 只显示文件图标（`/api/preview` 返回 `415`），照常可以下载校验；HEIC/HEIF 能否显示取决于浏览器。
 - **断点续传**：上传到一半中断（关页面 / 断网），重新选同一个文件，`POST /api/upload/init` 会返回 `next_index`，浏览器只补未验的块。
 - **列表 / 删除**：资料库列出服务端 `received/` 里的文件，可删除。
 
@@ -248,12 +251,13 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 
 ### HTTP API（供二次开发）
 
-所有 `/api/*` 请求必须带 `X-LT-Token` 头；静态页面（`/`、`/index.html`、`/app.js`、`/app.css`、`/sha256.js`）无需令牌。
+所有 `/api/*` 请求必须带 `X-LT-Token` 头；静态页面（`/`、`/index.html`、`/app.js`、`/app.css`、`/sha256.js`）无需令牌。**唯一例外是 `/api/preview`**：它额外接受查询参数 `t=<media_token>`，因为 `<video>` / `<img>` 无法自定义请求头；这个令牌只能用于预览，拿它调其他接口一律 `401`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`（开放模式为 `false`）、`tls` |
-| GET | `/api/list` | 列出资料库文件（name / size / mtime_ns） |
+| GET | `/api/info` | 服务信息、`chunk_size`、`token_required`（开放模式为 `false`）、`tls`、`media_token`（预览专用，开放模式为空）、`preview_ext`（可预览的图片 / 视频扩展名） |
+| GET | `/api/list` | 列出资料库文件（name / size / mtime_ns / kind=`image`\|`video`\|`other`） |
+| GET | `/api/preview?name=&index=` | **只读预览**：返回原文件原始字节（不解码、不转码），按扩展名给 `Content-Type`，支持 `Range`（`206` + `Accept-Ranges`，视频可拖进度）；未知 / 浏览器不认的格式（CR3、NEF、RAW…）→ `415`。`index` 可选，仅作客户端缓存键 |
 | POST | `/api/upload/init` | 提交清单；返回 `status=upload` + `next_index`（或 `complete` 幂等跳过） |
 | POST | `/api/upload/chunk?name=&index=` | 上传一块原始字节，服务端逐块校验 SHA-256 |
 | POST | `/api/upload/complete` | 整文件复算 → 原子发布 → 恢复元数据 |
