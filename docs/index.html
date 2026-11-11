@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>无损传输 · lossless-transfer — 字节级一致的照片 / 视频传输</title>
+<meta name="description" content="零第三方依赖的照片 / 视频无损传输工具：浏览器或命令行直传，分块 SHA-256 双向校验，不重编码、不压缩、不改 EXIF。">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0c1017">
+<meta property="og:type" content="website">
+<meta property="og:title" content="无损传输 · lossless-transfer">
+<meta property="og:description" content="字节级一致的照片 / 视频传输：SHA-256 双向校验，不重编码、不压缩、不改 EXIF。">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230c1017'/%3E%3Ctext x='16' y='23' font-size='19' text-anchor='middle' fill='%234ea1ff'%3E%E2%87%84%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0c1017; --surface:#141a24; --surface-2:#1b232f; --line:#242e3c;
+    --fg:#e7edf6; --muted:#94a3b8; --dim:#64748b;
+    --accent:#4ea1ff; --accent-2:#38d9a9; --warn:#ffb020;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--fg); font-family:var(--sans);
+    line-height:1.7; -webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 480px at 78% -12%, rgba(78,161,255,.16), transparent 62%),
+      radial-gradient(760px 420px at 8% 4%, rgba(56,217,169,.10), transparent 60%);
+    background-repeat:no-repeat;
+  }
+  a{color:var(--accent); text-decoration:none}
+  a:hover{text-decoration:underline}
+  code{font-family:var(--mono); font-size:.9em}
+  .wrap{max-width:1000px; margin:0 auto; padding:0 22px}
+  header{padding:26px 0 0}
+  .brand{display:flex; align-items:center; gap:12px}
+  .logo{
+    width:38px; height:38px; border-radius:11px; display:grid; place-items:center;
+    background:linear-gradient(150deg,#1d4ed8,#0ea5a3); color:#fff; font-size:20px; font-weight:700;
+    box-shadow:0 6px 18px rgba(29,78,216,.35);
+  }
+  .brand-txt{display:flex; flex-direction:column; line-height:1.35}
+  .brand-txt b{font-size:15.5px; letter-spacing:.2px}
+  .brand-txt span{font-family:var(--mono); font-size:11.5px; color:var(--dim)}
+
+  .hero{padding:54px 0 8px}
+  h1{font-size:clamp(28px,4.4vw,44px); line-height:1.25; margin:0 0 14px; letter-spacing:-.6px}
+  h1 em{font-style:normal; color:var(--accent)}
+  .lede{font-size:clamp(14.5px,1.6vw,17px); color:var(--muted); max-width:63ch; margin:0 0 26px}
+  .cta{display:flex; flex-wrap:wrap; gap:12px; align-items:center}
+  .btn{
+    display:inline-flex; align-items:center; gap:8px; padding:11px 18px; border-radius:10px;
+    font-size:14px; font-weight:600; border:1px solid transparent; transition:transform .15s, background .15s;
+  }
+  .btn:hover{text-decoration:none; transform:translateY(-1px)}
+  .btn.primary{background:var(--accent); color:#07121f}
+  .btn.primary:hover{background:#6cb2ff}
+  .btn.ghost{background:var(--surface); color:var(--fg); border-color:var(--line)}
+  .btn.ghost:hover{background:var(--surface-2)}
+
+  section{padding:46px 0 0}
+  h2{font-size:13px; letter-spacing:.16em; text-transform:uppercase; color:var(--dim); margin:0 0 18px; font-weight:600}
+
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px}
+  .card{
+    background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:18px 18px 16px;
+  }
+  .card i{display:block; font-size:19px; margin-bottom:8px; font-style:normal}
+  .card b{display:block; font-size:14.5px; margin-bottom:5px}
+  .card p{margin:0; font-size:13px; color:var(--muted); line-height:1.65}
+
+  .steps{display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:14px; counter-reset:s}
+  .step{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:16px 18px}
+  .step::before{
+    counter-increment:s; content:"0" counter(s); display:block; font-family:var(--mono);
+    font-size:11.5px; color:var(--accent); letter-spacing:.1em; margin-bottom:6px;
+  }
+  .step b{display:block; font-size:14px; margin-bottom:4px}
+  .step p{margin:0; font-size:12.8px; color:var(--muted)}
+
+  pre{
+    margin:0; background:#0a0e14; border:1px solid var(--line); border-radius:12px;
+    padding:15px 16px; overflow-x:auto; font-family:var(--mono); font-size:12.8px; line-height:1.75; color:#cfe0f5;
+  }
+  pre .c{color:var(--dim)}
+  pre .k{color:var(--accent-2)}
+  .tabs-note{font-size:12.5px; color:var(--dim); margin:8px 0 0}
+
+  .note{
+    display:flex; gap:12px; background:rgba(255,176,32,.08); border:1px solid rgba(255,176,32,.3);
+    border-radius:12px; padding:15px 17px; font-size:13.2px; color:#f6dcb0;
+  }
+  .note b{color:var(--warn)}
+  .note p{margin:0}
+
+  footer{
+    margin-top:52px; border-top:1px solid var(--line); padding:22px 0 40px;
+    color:var(--dim); font-size:12.5px; display:flex; flex-wrap:wrap; gap:10px 18px;
+    justify-content:space-between; align-items:center;
+  }
+  footer a{color:var(--muted)}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">⇄</span>
+    <span class="brand-txt">
+      <b>无损传输</b>
+      <span>lossless-transfer</span>
+    </span>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <h1>照片和视频传过去，<br>还是<em>一模一样的字节</em>。</h1>
+    <p class="lede">
+      一个零第三方依赖的传输工具：浏览器里拖拽上传、点选下载，分块 SHA-256 双向校验。
+      不重编码、不压缩、不缩放、不剥 EXIF —— 收到的字节与发出的字节完全一致。
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/hlj2008612/lossless-transfer">查看源码 →</a>
+      <a class="btn ghost" href="https://github.com/hlj2008612/lossless-transfer#readme">使用说明</a>
+    </div>
+  </div>
+
+  <section>
+    <h2>为什么不一样</h2>
+    <div class="grid">
+      <div class="card">
+        <i>🔐</i>
+        <b>三处哈希必须一致</b>
+        <p>浏览器算一段、服务端独立再算一遍，最后整文件复核。三方都相同才标记 VERIFIED。</p>
+      </div>
+      <div class="card">
+        <i>🧩</i>
+        <b>只搬字节，不解码</b>
+        <p>原图原视频直接搬运，分辨率、码率、色彩、EXIF、拍摄时间、容器格式原样保留。</p>
+      </div>
+      <div class="card">
+        <i>📦</i>
+        <b>零第三方依赖</b>
+        <p>服务端只用 Python 标准库，前端是四个静态文件，连 SHA-256 都是自己实现的。</p>
+      </div>
+      <div class="card">
+        <i>⏯️</i>
+        <b>断点续传</b>
+        <p>传到一半关页面、断网都没关系，重新选同一个文件会从最后一块继续。</p>
+      </div>
+      <div class="card">
+        <i>🌐</i>
+        <b>跨网络可用</b>
+        <p>配一条 SakuraFrp / frp 隧道即可跨公网使用，也能直接开原生 HTTPS。</p>
+      </div>
+      <div class="card">
+        <i>🖼️</i>
+        <b>预览不改原文件</b>
+        <p>缩略图取自相机写在 EXIF 里的那段，服务端不生成、不落盘任何派生图。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>它怎么工作</h2>
+    <div class="steps">
+      <div class="step">
+        <b>浏览器切块算哈希</b>
+        <p>按 4 MiB 切片读原始字节，逐块算 SHA-256，同时滚动算出整文件哈希。</p>
+      </div>
+      <div class="step">
+        <b>服务端独立复算</b>
+        <p>每块落盘前复算一次，整文件拼好后从头再算一次，任何一处不符立即中止。</p>
+      </div>
+      <div class="step">
+        <b>两端哈希对上才成功</b>
+        <p>页面显示「✓ 已验证 · 字节完全一致」，并保留原始修改时间。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>快速开始</h2>
+    <pre><span class="c"># Windows：一条命令起 HTTPS 服务（自动生成自签证书）</span>
+pwsh -NoProfile -File .\scripts\start_web.ps1 -Open
+
+<span class="c"># macOS / Linux：同一个服务，直接用 Python 标准库</span>
+python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./shared --token <span class="k">你的口令</span></pre>
+    <p class="tabs-note">启动后终端会打印访问地址与令牌，同一网络里用任意浏览器打开即可；跨网络再配一条 TCP 隧道。</p>
+  </section>
+
+  <section>
+    <div class="note">
+      <span aria-hidden="true">⚠️</span>
+      <p>
+        <b>这个页面只是项目介绍。</b>
+        GitHub Pages 只能托管静态文件，跑不了 Python 服务端 ——
+        真正的传输功能需要在你自己的电脑上启动 <code>web_transfer.py</code>（或那个 PowerShell 脚本），
+        然后把隧道地址发给自己要传文件的人。所有文件都在<b>你自己的机器上</b>，不经过这里。
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <span>mchlj.ccwu.cc · 由 GitHub Pages 托管</span>
+  <span>
+    <a href="https://github.com/hlj2008612/lossless-transfer">仓库</a> ·
+    <a href="https://github.com/hlj2008612/lossless-transfer/blob/main/LICENSE">MIT License</a>
+  </span>
+</footer>
+
+</body>
+</html>
