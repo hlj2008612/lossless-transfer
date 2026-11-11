@@ -1,0 +1,33 @@
+# Keep the image small and stop private data from ever entering it.
+.git
+.gitignore
+.workbuddy
+__pycache__
+**/__pycache__
+*.py[cod]
+
+# live photo/video data and per-upload artifacts
+shared
+received
+*.part
+*.lossless-state.json
+.lossless-web
+
+# private keys / certificates (the platform terminates TLS instead)
+tls
+*.pem
+*.key
+*.pfx
+*.p12
+!tests/fixtures/test_cert.pem
+!tests/fixtures/test_key.pem
+
+# not needed at runtime
+tests
+scripts
+docs
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+render.yaml

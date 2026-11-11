@@ -1,0 +1,28 @@
+# Render Blueprint: deploy web_transfer.py as a real web service, so the app -
+# not just a landing page - can answer on a custom domain.
+#
+# Render reads this file from the repo root. In the Render dashboard choose
+# "New +" -> "Blueprint", pick hlj2008612/lossless-transfer, and it will build
+# the Dockerfile below and inject a random LT_TOKEN.
+#
+# NOTE ON STORAGE: a free plan has an ephemeral filesystem, so /data survives a
+# request but not a restart/redeploy. Add a paid persistent disk (mount path
+# /data) to keep the library across restarts; see docs/CLOUD-DEPLOY.md.
+services:
+  - type: web
+    name: lossless-transfer
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: pages
+    dockerfilePath: ./Dockerfile
+    # "/" is the public front end (200). Do not use /api/info here: every
+    # /api/* route needs the token header, so the health check would get 401.
+    healthCheckPath: /
+    envVars:
+      - key: LT_TOKEN
+        generateValue: true      # Render creates one secret; read it in the dashboard
+      - key: PORT
+        value: "8080"
+      - key: LT_DIR
+        value: /data

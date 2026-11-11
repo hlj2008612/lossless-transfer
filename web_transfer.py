@@ -886,25 +886,44 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[web] %s - %s\n" % (self.address_string(), fmt % args))
 
 
+def _env(name: str, fallback: str) -> str:
+    """Environment variable value, or `fallback` when unset/blank."""
+    return os.environ.get(name, "").strip() or fallback
+
+
+def _env_int(name: str, fallback: int) -> int:
+    try:
+        return int(_env(name, str(fallback)))
+    except ValueError:
+        return fallback
+
+
 def build_parser() -> argparse.ArgumentParser:
+    # Defaults come from the environment so the same script can be started by
+    # a container platform with no arguments at all:
+    #   PORT    - the port the platform tells us to listen on (Heroku/Render/…)
+    #   LT_HOST - bind address (containers need 0.0.0.0)
+    #   LT_DIR  - the library folder (mount a volume here for real storage)
+    #   LT_TOKEN- the access token; ignored in --no-auth mode
     p = argparse.ArgumentParser(
         prog="web_transfer.py",
         description="Zero-dependency browser UI for byte-exact photo/video "
-                    "transfer (works over a SakuraFrp TCP tunnel).",
+                    "transfer (works over a SakuraFrp TCP tunnel or as a "
+                    "container behind a platform proxy).",
     )
     p.add_argument("--version", action="version", version="%(prog)s " + WEB_VERSION)
-    p.add_argument("--host", default="0.0.0.0",
-                   help="bind address (default 0.0.0.0)")
-    p.add_argument("--port", type=int, default=8765,
-                   help="TCP port (default 8765)")
-    p.add_argument("--dir", default="shared",
+    p.add_argument("--host", default=_env("LT_HOST", "0.0.0.0"),
+                   help="bind address (default $LT_HOST or 0.0.0.0)")
+    p.add_argument("--port", type=int, default=_env_int("PORT", 8765),
+                   help="TCP port (default $PORT or 8765)")
+    p.add_argument("--dir", default=_env("LT_DIR", "shared"),
                    help="the web library folder: files visible on the page "
-                        "(default ./shared, the same default as "
+                        "(default $LT_DIR, or ./shared - the same default as "
                         "scripts/start_web.ps1)")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
     p.add_argument("--token", default=None,
-                   help="access token; a random one is generated if omitted")
+                   help="access token (default $LT_TOKEN, or a random one)")
     p.add_argument("--no-auth", action="store_true",
                    help="open mode: no token at all, anyone who can reach the "
                         "URL may upload/download/delete (implies a public folder)")
@@ -941,7 +960,14 @@ def main(argv: Optional[list] = None) -> int:
         print("ERROR: --no-auth and --token are mutually exclusive",
               file=sys.stderr)
         return 2
-    token = "" if args.no_auth else (args.token or secrets.token_urlsafe(18))
+    # LT_TOKEN is how a container platform hands over the secret. It is read
+    # here rather than as the argparse default so that an explicit --token
+    # still wins, and so that --no-auth simply ignores it instead of failing
+    # with a confusing "mutually exclusive" error on a host that sets it.
+    if args.no_auth:
+        token = ""
+    else:
+        token = args.token or _env("LT_TOKEN", "") or secrets.token_urlsafe(18)
     cfg = Config(args.host, args.port, args.dir, args.chunk_size, token)
     cfg.ensure_dirs()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
