@@ -71,8 +71,10 @@ JPEG_EXTS = (".jpg", ".jpeg", ".jpe", ".jfif")
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 STATIC_TYPES = {
     "index.html": "text/html; charset=utf-8",
+    "gallery.html": "text/html; charset=utf-8",
     "app.js": "application/javascript; charset=utf-8",
     "app.css": "text/css; charset=utf-8",
+    "gallery.css": "text/css; charset=utf-8",
     "sha256.js": "application/javascript; charset=utf-8",
 }
 INTERNAL_SUFFIXES = (lt.RECV_SUFFIX, lt.STATE_SUFFIX, lt.MANIFEST_SUFFIX)
@@ -486,7 +488,9 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_static(self, path: str) -> None:
         if path in ("/", "/index.html"):
             fname = "index.html"
-        elif path in ("/app.js", "/app.css", "/sha256.js"):
+        elif path in ("/gallery", "/gallery.html"):
+            fname = "gallery.html"
+        elif path in ("/app.js", "/app.css", "/gallery.css", "/sha256.js"):
             fname = path.lstrip("/")
         elif path == "/favicon.ico":
             self._send_bytes(b"", "image/x-icon", 204)

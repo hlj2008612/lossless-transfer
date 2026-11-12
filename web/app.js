@@ -18,15 +18,43 @@
   'use strict';
 
   var $ = function (id) { return document.getElementById(id); };
-  var token = sessionStorage.getItem('lt_token') || '';
+
+  // Two pages share this script: the home page (connect / upload / log) and the
+  // photo-wall gallery. Every piece of wiring is guarded by page, so neither
+  // page ever touches an element that only the other one has.
+  var PAGE = document.body.getAttribute('data-page') || 'home';
+  var isGallery = PAGE === 'gallery';
+
+  // localStorage (not just sessionStorage) so the token follows you from the
+  // home page into the gallery; sessionStorage stays as the fallback for a
+  // token saved by an older build of this file.
+  var token = localStorage.getItem('lt_token') ||
+              sessionStorage.getItem('lt_token') || '';
   var tokenRequired = true;
   var serverChunk = 0;
   var mediaToken = '';      // header-less media use this instead of X-LT-Token
   var busy = false;
 
   // ---- logging ------------------------------------------------------------
+  // The home page owns the log panel. The gallery has no panel: it surfaces the
+  // same messages as a transient toast instead, so nothing is lost off-screen.
+  var toastTimer = 0;
+  function toast(msg, cls) {
+    if (!isGallery) return;
+    var el = $('toast');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = 'toast ' + (cls || '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.className = 'toast hidden'; }, 4200);
+  }
+
   function log(msg, cls) {
     var box = $('logBox');
+    if (!box) {
+      if (cls) toast(msg, cls);
+      return;
+    }
     var d = document.createElement('div');
     var t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
     d.innerHTML = '<span class="t">[' + t + ']</span> ';
@@ -76,6 +104,13 @@
   function qs(s) { return encodeURIComponent(s); }
 
   // ---- connection ---------------------------------------------------------
+  function setBadge(text, on) {
+    var b = $('connBadge');
+    if (!b) return;
+    b.className = 'badge ' + (on ? 'badge-on' : 'badge-off');
+    b.textContent = text;
+  }
+
   async function connect() {
     token = (($('token') && $('token').value.trim()) || token);
     var info;
@@ -87,25 +122,33 @@
     } catch (e) {
       // 401 means the server does require a token: show the input and stop.
       if (e.status === 401) {
+        if (isGallery) {
+          toast('需要 ACCESS TOKEN：请先回到首页输入令牌', 'err');
+          return;
+        }
         showTokenInput();
         log('需要 ACCESS TOKEN：请输入服务端启动时打印的令牌。', 'err');
         return;
       }
-      $('connBadge').className = 'badge badge-off';
-      $('connBadge').textContent = '未连接';
+      setBadge('未连接', false);
       log('连接失败：' + e.message, 'err');
       return;
     }
     if (tokenRequired) {
-      if (!token) { showTokenInput(); log('请先输入 ACCESS TOKEN', 'err'); return; }
+      if (!token) {
+        if (isGallery) { toast('需要 ACCESS TOKEN：请先回到首页输入令牌', 'err'); return; }
+        showTokenInput();
+        log('请先输入 ACCESS TOKEN', 'err');
+        return;
+      }
       sessionStorage.setItem('lt_token', token);
+      localStorage.setItem('lt_token', token);
     } else {
       // Open mode: nothing to type, so hide the connection card entirely.
       hideTokenInput();
     }
     try {
-      $('connBadge').className = 'badge badge-on';
-      $('connBadge').textContent = '已连接 v' + info.version;
+      setBadge('已连接 v' + info.version, true);
       // Built as elements, never HTML strings: file names and server strings
       // are untrusted text and must not be able to inject markup.
       var infoRows = [
@@ -115,23 +158,28 @@
         ['协议版本', String(info.protocol)]
       ];
       var box = $('connInfo');
-      box.innerHTML = '';
-      infoRows.forEach(function (kv) {
-        var row = document.createElement('div');
-        var k = document.createElement('span');
-        k.className = 'kv-k';
-        k.textContent = kv[0];
-        var v = document.createElement('span');
-        v.className = 'kv-v';
-        v.textContent = kv[1];
-        v.title = kv[1];
-        row.appendChild(k);
-        row.appendChild(v);
-        box.appendChild(row);
-      });
-      $('workspace').classList.remove('hidden');
+      if (box) {
+        box.innerHTML = '';
+        infoRows.forEach(function (kv) {
+          var row = document.createElement('div');
+          var k = document.createElement('span');
+          k.className = 'kv-k';
+          k.textContent = kv[0];
+          var v = document.createElement('span');
+          v.className = 'kv-v';
+          v.textContent = kv[1];
+          v.title = kv[1];
+          row.appendChild(k);
+          row.appendChild(v);
+          box.appendChild(row);
+        });
+      }
+      var ws = $('workspace');
+      if (ws) ws.classList.remove('hidden');
       log('连接成功，服务端 chunk_size=' + serverChunk, 'ok');
-      if (!tokenRequired) log('该共享文件夹为开放模式：任何人打开此地址均可上传/下载/删除。', 'warn');
+      if (!tokenRequired && !isGallery) {
+        log('该共享文件夹为开放模式：任何人打开此地址均可上传/下载/删除。', 'warn');
+      }
       await refresh();
     } catch (e) {
       log('连接失败：' + e.message, 'err');
@@ -573,6 +621,12 @@
         // paints the frame, so a dimmed arrow must not sit on top of it.
         card.el.classList.add('thumb-loaded', 'has-still');
         card.el.classList.remove('thumb-unsupported');
+        // A clip is usually 16:9, not the 3:4 stand-in the column maths used;
+        // adopt the real size now that metadata has arrived.
+        if (v.videoWidth && v.videoHeight) {
+          var fig = card.el.querySelector('.card-fig');
+          if (fig) fig.style.aspectRatio = (v.videoWidth / v.videoHeight);
+        }
       } else {
         v.removeAttribute('src');
         try { v.load(); } catch (e) { /* ignore */ }
@@ -639,6 +693,24 @@
     }
   }
 
+  // Every card keeps its own aspect ratio - that is what makes the wall read as
+  // photos instead of uniform tiles. The EXIF thumbnail is a scaled copy of the
+  // full frame, so its natural size is the true ratio of the stored pixels; for
+  // a 90/270 transfer (orient 5-8) the stored frame lies sideways and the box
+  // ratio must be swapped so the CSS rotation lands exactly in the box.
+  function applyCardAspect(card, w, h) {
+    if (!w || !h) return;
+    var fig = card.el.querySelector('.card-fig');
+    if (!fig) return;
+    var ratio = (card.orient >= 5) ? (h / w) : (w / h);
+    // A corrupt thumbnail tag can claim an absurd size; clamping keeps one card
+    // from turning a column into a tower.
+    ratio = Math.min(Math.max(ratio, 0.25), 4);
+    fig.style.aspectRatio = ratio;
+    // 90/270 turns need to grow by 1/boxRatio to cover the box again
+    card.el.style.setProperty('--rot', (1 / ratio).toFixed(4));
+  }
+
   // Put a blob on the card's <img> and let the browser's decoder be the judge:
   // when these bytes cannot be rendered the card keeps its placeholder and the
   // caller tries a larger slice. Resolves true only when something was shown.
@@ -659,6 +731,7 @@
         card.orient = (orient >= 2 && orient <= 8) ? orient : 1;
         if (card.orient > 1) card.el.setAttribute('data-orient', card.orient);
         else card.el.removeAttribute('data-orient');
+        applyCardAspect(card, img.naturalWidth, img.naturalHeight);
         card.el.classList.remove('is-loading', 'thumb-unsupported');
         card.el.classList.add('thumb-loaded');
         resolve(true);
@@ -835,21 +908,80 @@
     revokeCards();
     if (io) io.disconnect();
     var list = $('fileList');
+    if (list) list.innerHTML = '';
+    wallCols = [];
+  }
+
+  // ---- photo wall (masonry) ----------------------------------------------
+  // Column count follows the same seven steps the reference site uses, so the
+  // wall keeps its density at every width instead of drifting with a linear
+  // formula (the gaps between steps are uneven on purpose).
+  function columnCount() {
+    var w = window.innerWidth;
+    if (w >= 1900) return 8;
+    if (w >= 1680) return 7;
+    if (w >= 1500) return 6;
+    if (w >= 1280) return 5;
+    if (w >= 1024) return 4;
+    if (w >= 768) return 3;
+    return 2;
+  }
+
+  var wallCols = [];
+  var lastColCount = 0;
+
+  function buildColumns(list) {
     list.innerHTML = '';
+    wallCols = [];
+    // A handful of photos must not be spread over eight empty columns: the
+    // count shrinks to the number of items (never below one), and the CSS caps
+    // each column's width so a two-photo wall reads as a neat centred pair
+    // instead of two huge slabs.
+    var n = Math.min(columnCount(), Math.max(1, files.length));
+    for (var i = 0; i < n; i++) {
+      var col = document.createElement('div');
+      col.className = 'wall-col';
+      list.appendChild(col);
+      wallCols.push(col);
+    }
+    lastColCount = n;
+    return wallCols;
+  }
+
+  // Rough height of a card at this column width. It only decides WHICH column a
+  // card goes into; the exact height arrives with the thumbnail and the card
+  // simply grows in place, which is what a waterfall is supposed to do.
+  function estimateHeight(f, col) {
+    var cw = (col && col.clientWidth) || 260;
+    var ratio = (f.kind === 'video') ? (16 / 9) : (3 / 4);
+    return cw / ratio + 96;
+  }
+
+  function shortest(heights) {
+    var target = 0;
+    for (var i = 1; i < heights.length; i++) {
+      if (heights[i] < heights[target]) target = i;
+    }
+    return target;
   }
 
   function renderGrid() {
+    if (!isGallery) return;          // the home page keeps only a summary
     clearGrid();
     var list = $('fileList');
+    if (!list) return;
     viewed = [];
     if (!files.length) {
       list.classList.add('empty');
-      list.innerHTML = '<div class="list-empty">资料库为空。上传一张照片或一段视频试试。</div>';
+      list.innerHTML = '<div class="list-empty">资料库还是空的<br>回到首页上传第一张照片吧</div>';
       updateSelBar();
       return;
     }
     list.classList.remove('empty');
+    var cols = buildColumns(list);
+    var heights = cols.map(function () { return 0; });
     var thumbIndex = 0;
+    var order = 0;
     files.forEach(function (f) {
       if (f.kind === 'image' || f.kind === 'video') {
         thumbIndex += 1;
@@ -858,7 +990,12 @@
       var idx = thumbIndex;    // stable-ish version key for preview URLs
       var card = buildCard(f, idx);
       cards[f.name] = card;
-      list.appendChild(card.el);
+      // staggered entrance, capped so a big library is not a 30-second show
+      card.el.style.setProperty('--d', Math.min(order, 18) * 30 + 'ms');
+      var target = shortest(heights);
+      cols[target].appendChild(card.el);
+      heights[target] += estimateHeight(f, cols[target]);
+      order += 1;
       if (f.kind === 'image') {
         if (io) io.observe(card.el);
         else loadThumb(card);
@@ -868,6 +1005,25 @@
       }
     });
     updateSelBar();
+  }
+
+  // Crossing a column breakpoint re-deals the existing cards. The <img> blobs
+  // stay attached to their elements, so this never refetches a preview.
+  function relayoutWall() {
+    if (!isGallery || !files.length) return;
+    var want = Math.min(columnCount(), Math.max(1, files.length));
+    if (want === lastColCount) return;
+    var list = $('fileList');
+    if (!list) return;
+    var cols = buildColumns(list);
+    var heights = cols.map(function () { return 0; });
+    files.forEach(function (f) {
+      var card = cards[f.name];
+      if (!card) return;
+      var target = shortest(heights);
+      cols[target].appendChild(card.el);
+      heights[target] += (card.el.offsetHeight || estimateHeight(f, cols[target]));
+    });
   }
 
   function countNote() {
@@ -892,7 +1048,15 @@
       var alive = {};
       files.forEach(function (f) { if (selected[f.name]) alive[f.name] = true; });
       selected = alive;
-      $('libCount').textContent = countNote();
+      var count = $('libCount');
+      if (count) count.textContent = countNote();
+      var empty = $('libEmpty');
+      if (empty) empty.classList.toggle('hidden', files.length > 0);
+      var pill = $('libPill');
+      if (pill) {
+        pill.textContent = files.length ? files.length + ' 项' : '';
+        pill.classList.toggle('hidden', !files.length);
+      }
       renderGrid();
       // Keep an open lightbox in step with the new list.
       if (lb.state.open) relight();
@@ -939,6 +1103,7 @@
   }
 
   function updateSelBar() {
+    if (!isGallery) return;          // selection lives on the photo wall only
     var names = selectedNames();
     var n = names.length;
     var total = 0;
@@ -961,20 +1126,13 @@
     syncSelBar();
   }
 
-  // The bar lives in the library card; once the grid top has scrolled out of
-  // view it pins itself to the bottom of the viewport (so batch actions are
-  // always reachable), and it un-pins the moment the library comes back.
-  var selPinned = false;
-  function scrollY() { return window.pageYOffset || document.documentElement.scrollTop || 0; }
+  // On the wall page the bar is always docked to the viewport (see
+  // gallery.css), so there is no pin/unpin dance: it just appears while
+  // something is selected and reserves room at the bottom of the page.
   function syncSelBar() {
+    if (!isGallery) return;
     var on = selectedNames().length > 0;
-    var libTop = $('libCard').getBoundingClientRect().top + scrollY();
-    var pin = on && scrollY() > libTop + 8;
-    if (pin !== selPinned) {
-      selPinned = pin;
-      $('selBar').classList.toggle('sel-pinned', pin);
-    }
-    document.body.classList.toggle('has-selbar', on && pin);
+    document.body.classList.toggle('has-selbar', on);
   }
 
   async function downloadSelected() {
@@ -1247,51 +1405,57 @@
   });
 
   // ---- wiring -------------------------------------------------------------
-  $('token').value = token;
-  $('connectBtn').onclick = connect;
-  $('token').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') connect();
-  });
-  $('refreshBtn').onclick = refresh;
-  $('selectAll').addEventListener('change', function (e) {
-    var on = e.target.checked;
-    files.forEach(function (f) { toggleSelect(f.name, on); });
-  });
-  $('invertBtn').onclick = function () {
-    files.forEach(function (f) { toggleSelect(f.name, !selected[f.name]); });
-  };
-  $('selClearBtn').onclick = function () {
-    files.forEach(function (f) { toggleSelect(f.name, false); });
-  };
-  $('selDownloadBtn').onclick = downloadSelected;
-  $('logClearBtn').onclick = function () { $('logBox').innerHTML = ''; };
-  $('fileInput').onchange = function (e) {
-    uploadFiles(Array.prototype.slice.call(e.target.files));
-    e.target.value = '';
-  };
-  var drop = $('drop');
-  ['dragenter', 'dragover'].forEach(function (ev) {
-    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('hover'); });
-  });
-  ['dragleave', 'drop'].forEach(function (ev) {
-    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('hover'); });
-  });
-  drop.addEventListener('drop', function (e) {
-    uploadFiles(Array.prototype.slice.call(e.dataTransfer.files));
-  });
-  window.addEventListener('dragover', function (e) { e.preventDefault(); });
-  window.addEventListener('drop', function (e) { e.preventDefault(); });
-  var scrollPending = false;
-  function onScrollOrResize() {
-    if (scrollPending) return;
-    scrollPending = true;
-    (window.requestAnimationFrame || setTimeout)(function () {
-      scrollPending = false;
-      syncSelBar();
+  if (isGallery) {
+    $('refreshBtn').onclick = refresh;
+    $('selectAll').addEventListener('change', function (e) {
+      var on = e.target.checked;
+      files.forEach(function (f) { toggleSelect(f.name, on); });
     });
+    $('invertBtn').onclick = function () {
+      files.forEach(function (f) { toggleSelect(f.name, !selected[f.name]); });
+    };
+    $('selClearBtn').onclick = function () {
+      files.forEach(function (f) { toggleSelect(f.name, false); });
+    };
+    $('selDownloadBtn').onclick = downloadSelected;
+    window.addEventListener('scroll', function () {
+      // nothing to pin any more: kept so the selection bar stays in sync
+      // after a programmatic scroll
+      updateSelBar();
+    }, { passive: true });
+    var relayoutPending = false;
+    window.addEventListener('resize', function () {
+      if (relayoutPending) return;
+      relayoutPending = true;
+      (window.requestAnimationFrame || setTimeout)(function () {
+        relayoutPending = false;
+        relayoutWall();
+      });
+    });
+  } else {
+    $('token').value = token;
+    $('connectBtn').onclick = connect;
+    $('token').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') connect();
+    });
+    $('logClearBtn').onclick = function () { $('logBox').innerHTML = ''; };
+    $('fileInput').onchange = function (e) {
+      uploadFiles(Array.prototype.slice.call(e.target.files));
+      e.target.value = '';
+    };
+    var drop = $('drop');
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('hover'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('hover'); });
+    });
+    drop.addEventListener('drop', function (e) {
+      uploadFiles(Array.prototype.slice.call(e.dataTransfer.files));
+    });
+    window.addEventListener('dragover', function (e) { e.preventDefault(); });
+    window.addEventListener('drop', function (e) { e.preventDefault(); });
   }
-  window.addEventListener('scroll', onScrollOrResize, { passive: true });
-  window.addEventListener('resize', onScrollOrResize);
 
   // Bootstrap: always probe /api/info. In open mode this connects with no
   // input at all; in token mode a 401 triggers the token form instead.

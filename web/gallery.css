@@ -1,0 +1,355 @@
+/* gallery.css - the photo wall page.
+ *
+ * Visual and interaction reference: the mqz photo-wall site
+ * (https://zmq-hlj.ccwu.cc/#/pictorial): floating pill nav, near-black canvas,
+ * masonry columns of rounded "glass" cards that lift and catch a sheen on
+ * hover, and a blur-reveal entrance. Everything here is theme-aware: the light
+ * theme gets the same anatomy with white glass instead of dark glass.
+ *
+ * Layout is plain flex columns (no masonry library, no dependency). app.js
+ * assigns every card to the currently shortest column, so columns stay level
+ * regardless of how many files there are or how different their aspect ratios.
+ */
+
+/* ---- wall tokens --------------------------------------------------------- */
+:root{
+  --wall-bg:#f4f5f8;
+  --wall-bg-glow:rgba(31,111,235,.10);
+  --glass:rgba(255,255,255,.92);
+  --glass-hover:rgba(255,255,255,.98);
+  --glass-line:rgba(16,24,40,.09);
+  --glass-line-strong:rgba(16,24,40,.16);
+  --glass-shadow:0 2px 8px rgba(16,24,40,.06), 0 12px 32px rgba(16,24,40,.07);
+  --glass-shadow-hover:0 6px 18px rgba(16,24,40,.10), 0 22px 48px rgba(16,24,40,.12);
+  --sheen:rgba(255,255,255,.55);
+  --nav-bg:rgba(255,255,255,.78);
+  --nav-line:rgba(16,24,40,.10);
+  --gap:14px;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --wall-bg:#0b0c10;
+    --wall-bg-glow:rgba(74,158,255,.14);
+    --glass:rgba(255,255,255,.045);
+    --glass-hover:rgba(255,255,255,.075);
+    --glass-line:rgba(255,255,255,.09);
+    --glass-line-strong:rgba(255,255,255,.20);
+    --glass-shadow:0 8px 24px rgba(0,0,0,.45);
+    --glass-shadow-hover:0 16px 44px rgba(0,0,0,.6), 0 0 0 1px rgba(255,255,255,.06);
+    --sheen:rgba(255,255,255,.16);
+    --nav-bg:rgba(18,20,26,.72);
+    --nav-line:rgba(255,255,255,.09);
+  }
+}
+html[data-theme="light"]{
+  --wall-bg:#f4f5f8; --wall-bg-glow:rgba(31,111,235,.10);
+  --glass:rgba(255,255,255,.92); --glass-hover:rgba(255,255,255,.98);
+  --glass-line:rgba(16,24,40,.09); --glass-line-strong:rgba(16,24,40,.16);
+  --glass-shadow:0 2px 8px rgba(16,24,40,.06), 0 12px 32px rgba(16,24,40,.07);
+  --glass-shadow-hover:0 6px 18px rgba(16,24,40,.10), 0 22px 48px rgba(16,24,40,.12);
+  --sheen:rgba(255,255,255,.55);
+  --nav-bg:rgba(255,255,255,.78); --nav-line:rgba(16,24,40,.10);
+}
+
+/* ---- page shell ---------------------------------------------------------- */
+body.gallery{
+  padding:0;
+  background:
+    radial-gradient(1200px 520px at 50% -260px, var(--wall-bg-glow), transparent 70%),
+    var(--wall-bg);
+  background-attachment:fixed;
+  min-height:100vh;
+}
+
+/* ---- floating pill nav --------------------------------------------------- */
+.gnav{
+  position:fixed; top:14px; left:50%; transform:translateX(-50%);
+  z-index:60;
+  width:min(1180px, calc(100vw - 32px));
+  display:flex; align-items:center; gap:14px;
+  padding:8px 10px 8px 14px;
+  border-radius:999px;
+  background:var(--nav-bg);
+  border:1px solid var(--nav-line);
+  backdrop-filter:blur(22px) saturate(150%);
+  -webkit-backdrop-filter:blur(22px) saturate(150%);
+  box-shadow:0 10px 34px rgba(0,0,0,.14);
+}
+.gnav-brand{
+  display:inline-flex; align-items:center; gap:9px; text-decoration:none; color:var(--fg);
+  flex:0 0 auto;
+}
+.gnav-brand .logo{
+  width:30px; height:30px; border-radius:9px; font-size:16px;
+  background:linear-gradient(135deg, #5b9bff, #8b6ce8);
+  color:#fff; box-shadow:0 4px 14px rgba(91,155,255,.35);
+}
+.gnav-title{font-size:14px; font-weight:650; letter-spacing:.2px; white-space:nowrap}
+.gnav-links{display:flex; align-items:center; gap:2px; margin-left:6px; min-width:0}
+.gnav-links a{
+  text-decoration:none; color:var(--muted); font-size:13.5px; padding:6px 14px;
+  border-radius:999px; white-space:nowrap; transition:color .2s, background .2s;
+}
+.gnav-links a:hover{color:var(--fg)}
+.gnav-links a.is-active{
+  color:var(--fg); font-weight:600;
+  background:var(--surface-2);
+  border:1px solid var(--glass-line);
+}
+.gnav-side{margin-left:auto; display:flex; align-items:center; gap:8px; flex:0 0 auto}
+.gnav-icon{
+  width:32px; height:32px; border-radius:50%; display:grid; place-items:center;
+  border:1px solid var(--glass-line); background:transparent; color:var(--fg-2);
+  cursor:pointer; transition:background .2s, color .2s, transform .3s;
+}
+.gnav-icon:hover{background:var(--surface-2); color:var(--fg); transform:rotate(90deg)}
+.gnav-icon:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+
+/* ---- toolbar ------------------------------------------------------------- */
+.wall-main{
+  max-width:1760px; margin:0 auto;
+  padding:98px 22px 64px;
+}
+.wall-toolbar{
+  display:flex; align-items:flex-end; justify-content:space-between; gap:14px;
+  margin-bottom:18px; flex-wrap:wrap;
+}
+.wall-title{margin:0; font-size:22px; font-weight:700; letter-spacing:.3px}
+.wall-sub{display:block; margin-top:3px; color:var(--muted); font-size:12.5px}
+.wall-tools{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+
+/* ---- masonry wall -------------------------------------------------------- */
+.wall{
+  display:flex; align-items:flex-start; justify-content:center; gap:var(--gap);
+}
+.wall.empty{display:block}
+/* Column width is shared out evenly, but never past --col-max: a wall with two
+   photos then sits as a tidy centred pair instead of two half-page slabs. */
+.wall-col{flex:1 1 0; min-width:0; max-width:var(--col-max,360px)}
+
+.list-empty{
+  color:var(--muted); font-size:13.5px; text-align:center;
+  padding:80px 0; line-height:2;
+}
+
+/* ---- card ---------------------------------------------------------------- */
+.card-item{
+  position:relative; width:100%; margin-bottom:var(--gap);
+  border-radius:18px; overflow:hidden;
+  background:var(--glass);
+  border:1px solid var(--glass-line);
+  box-shadow:var(--glass-shadow);
+  contain:layout style;
+  transform:translateZ(0);
+  transition:transform .45s cubic-bezier(.23,1,.32,1),
+             box-shadow .45s cubic-bezier(.23,1,.32,1),
+             border-color .45s cubic-bezier(.23,1,.32,1);
+  animation:wall-in .7s cubic-bezier(.23,1,.32,1) backwards;
+  animation-delay:var(--d, 0ms);
+}
+@keyframes wall-in{
+  from{opacity:0; filter:blur(14px); transform:translateY(16px)}
+  to{opacity:1; filter:none; transform:none}
+}
+/* hover: lift + deepen + sheen sweep (pointer devices only) */
+@media (hover:hover) and (pointer:fine){
+  .card-item:hover{
+    transform:translateY(-6px);
+    box-shadow:var(--glass-shadow-hover);
+    border-color:var(--glass-line-strong);
+    z-index:2;
+  }
+  .card-item::before{
+    content:""; position:absolute; inset:0; z-index:3; pointer-events:none;
+    background:linear-gradient(115deg, transparent 38%, var(--sheen) 47%, transparent 62%);
+    transform:translateX(-130%); opacity:0;
+  }
+  .card-item:hover::before{animation:card-sheen .9s cubic-bezier(.23,1,.32,1) 1}
+}
+@keyframes card-sheen{
+  0%{transform:translateX(-130%); opacity:0}
+  30%{opacity:1}
+  100%{transform:translateX(130%); opacity:0}
+}
+.card-item.is-selected{
+  border-color:var(--accent);
+  box-shadow:0 0 0 2px var(--accent-soft), var(--glass-shadow);
+}
+
+/* media box: aspect ratio comes from the file itself (app.js fills it in once
+   the thumbnail decodes), 3:4 until then so the column maths stays sane */
+.card-fig{
+  position:relative; aspect-ratio:3 / 4;
+  background:var(--surface-2); overflow:hidden;
+}
+.card-thumb{
+  display:block; width:100%; height:100%; object-fit:cover;
+  opacity:0; transition:opacity .5s, scale .8s cubic-bezier(0,0,.2,1);
+}
+.thumb-loaded .card-thumb{opacity:1}
+/* Zoom uses the standalone `scale` property, not `transform`: the EXIF
+   orientation rules below own `transform`, and the two must not cancel. */
+@media (hover:hover) and (pointer:fine){
+  .card-item:hover .card-thumb{scale:1.035}
+}
+/* The camera's EXIF thumbnail is a bare JPEG with no orientation tag, so the
+   wall applies the main file's 0x0112 itself. The media box already carries the
+   swapped ratio for 5-8 (see applyCardAspect), which is why the 90/270 turns
+   only need `--rot` (= 1 / boxRatio) to cover the box again. */
+.card-item[data-orient="2"] .card-thumb{transform:scaleX(-1)}
+.card-item[data-orient="3"] .card-thumb{transform:rotate(180deg)}
+.card-item[data-orient="4"] .card-thumb{transform:scaleY(-1)}
+.card-item[data-orient="5"] .card-thumb{transform:rotate(90deg) scaleY(-1) scale(var(--rot,1.3334))}
+.card-item[data-orient="6"] .card-thumb{transform:rotate(90deg) scale(var(--rot,1.3334))}
+.card-item[data-orient="7"] .card-thumb{transform:rotate(270deg) scaleY(-1) scale(var(--rot,1.3334))}
+.card-item[data-orient="8"] .card-thumb{transform:rotate(270deg) scale(var(--rot,1.3334))}
+.card-ph{
+  position:absolute; inset:0; display:flex; flex-direction:column;
+  align-items:center; justify-content:center; gap:6px; color:var(--muted);
+  background:
+    radial-gradient(120% 80% at 50% 0%, rgba(255,255,255,.05), transparent 70%),
+    var(--surface-2);
+  transition:opacity .35s;
+}
+.card-ph-icon{font-size:24px; line-height:1; opacity:.75}
+.card-ph-kind{font-size:11.5px; letter-spacing:.4px}
+.thumb-loaded .card-ph{opacity:0}
+.card-item.is-loading .card-ph{animation:ph-pulse 1.5s ease-in-out infinite}
+@keyframes ph-pulse{50%{opacity:.5}}
+.card-item.thumb-unsupported .card-fig{
+  background:repeating-linear-gradient(135deg, var(--surface-2) 0 10px, var(--surface) 10px 20px);
+}
+.card-item.thumb-unsupported .card-ph{background:transparent}
+.card-item:not(.kind-image) .card-ph{position:relative; inset:auto; width:100%; height:100%}
+
+/* video poster paints over the placeholder once a frame arrives */
+.card-poster{
+  position:absolute; inset:0; z-index:1; width:100%; height:100%;
+  object-fit:cover; background:transparent; opacity:0; pointer-events:none;
+  transition:opacity .35s;
+}
+.has-still .card-poster{opacity:1}
+.has-still .card-ph{opacity:0}
+.card-badge{
+  position:absolute; left:10px; bottom:10px; z-index:2;
+  font-size:11px; padding:3px 9px; border-radius:999px;
+  background:rgba(0,0,0,.55); color:#fff;
+  backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+  pointer-events:none;
+}
+.card-open{
+  position:absolute; inset:0; z-index:1; border:0; padding:0; margin:0;
+  background:transparent; cursor:zoom-in; -webkit-tap-highlight-color:transparent;
+}
+.card-open:focus-visible{outline:2px solid var(--accent); outline-offset:-3px}
+
+/* selection checkbox: small glass circle, always reachable */
+.pick{
+  position:absolute; top:9px; left:9px; z-index:4;
+  width:26px; height:26px; border-radius:50%;
+  display:grid; place-items:center; cursor:pointer;
+  background:rgba(0,0,0,.38);
+  border:1px solid rgba(255,255,255,.35);
+  backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+  opacity:0; transition:opacity .25s, background .2s, border-color .2s;
+}
+.card-item:hover .pick, .pick:focus-within, .is-selected .pick{opacity:1}
+@media (hover:none){ .pick{opacity:1} }
+.pick input{
+  width:14px; height:14px; margin:0; accent-color:#fff; cursor:pointer;
+  border-radius:50%;
+}
+.is-selected .pick{background:var(--accent); border-color:transparent}
+
+/* info block: name + meta, then the actions row */
+.card-info{
+  padding:11px 13px 0;
+  border-top:1px solid var(--glass-line);
+}
+.card-name{
+  font-size:13px; font-weight:600; color:var(--fg);
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.card-meta{
+  font-size:11.5px; color:var(--muted); margin-top:2px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.card-acts{
+  display:flex; gap:6px; padding:9px 13px 12px;
+  transition:opacity .25s, transform .25s;
+}
+.card-acts .btn{
+  flex:1; padding:5px 8px; font-size:12px;
+  background:transparent; border-color:var(--glass-line);
+}
+.card-acts .btn:hover{background:var(--surface-2); border-color:var(--glass-line-strong)}
+@media (hover:hover) and (pointer:fine){
+  .card-acts{opacity:0; transform:translateY(4px)}
+  .card-item:hover .card-acts,
+  .card-item:focus-within .card-acts{opacity:1; transform:none}
+}
+
+/* ---- selection bar (always floats on this page) -------------------------- */
+.wall-main .selbar{
+  position:fixed; left:50%; transform:translateX(-50%);
+  bottom:calc(18px + env(safe-area-inset-bottom)); z-index:55;
+  width:min(620px, calc(100vw - 28px)); margin:0;
+  padding:10px 12px 10px 16px; border-radius:999px;
+  background:var(--nav-bg); border:1px solid var(--nav-line);
+  backdrop-filter:blur(22px) saturate(150%);
+  -webkit-backdrop-filter:blur(22px) saturate(150%);
+  box-shadow:0 14px 40px rgba(0,0,0,.22);
+  animation:sel-in .18s ease-out;
+}
+@keyframes sel-in{from{opacity:0; transform:translate(-50%, 10px)} to{opacity:1; transform:translate(-50%, 0)}}
+body.has-selbar{padding-bottom:92px}
+.selbar .btn.small{padding:6px 13px}
+
+/* ---- toast (this page has no log panel) --------------------------------- */
+.toast{
+  position:fixed; left:50%; transform:translateX(-50%);
+  bottom:calc(92px + env(safe-area-inset-bottom)); z-index:57;
+  max-width:min(560px, calc(100vw - 32px));
+  padding:9px 16px; border-radius:12px; font-size:12.5px; line-height:1.5;
+  background:rgba(20,22,28,.94); color:#e9edf5;
+  border:1px solid rgba(255,255,255,.12);
+  box-shadow:0 12px 30px rgba(0,0,0,.35);
+}
+.toast.ok{border-color:rgba(74,222,155,.45)}
+.toast.err{border-color:rgba(255,123,123,.5)}
+
+.wall-foot{
+  margin:28px auto 0; max-width:640px; text-align:center;
+  color:var(--muted); font-size:12px; line-height:1.8;
+}
+.wall-foot b{color:var(--fg-2)}
+
+/* ---- responsive ---------------------------------------------------------- */
+@media (max-width:768px){
+  :root{--gap:9px}
+  .gnav{top:10px; width:calc(100vw - 20px); padding:7px 8px 7px 11px; gap:8px}
+  .gnav-title{display:none}
+  .gnav-links{margin-left:0}
+  .gnav-links a{padding:6px 11px; font-size:13px}
+  .gnav-side .pill{display:none}
+  .wall-main{padding:84px 10px 92px}
+  .wall-toolbar{margin-bottom:12px; align-items:center}
+  .wall-title{font-size:18px}
+  .card-item{border-radius:14px}
+  .card-info{padding:9px 10px 0}
+  .card-name{font-size:12px}
+  .card-meta{font-size:11px}
+  .card-acts{padding:8px 10px 10px; gap:5px}
+  .card-acts .btn{font-size:11.5px; padding:5px 4px}
+  .pick{width:24px; height:24px}
+  .lb-nav{display:none}
+}
+@media (max-width:420px){
+  .card-acts{flex-direction:column}
+  .card-acts .btn{width:100%}
+}
+
+@media (prefers-reduced-motion: reduce){
+  .card-item{animation:none}
+  .card-item::before{display:none}
+}

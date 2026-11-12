@@ -8,7 +8,7 @@
 <title>无损传输 · 照片 / 视频</title>
 <link rel="stylesheet" href="/app.css">
 </head>
-<body>
+<body data-page="home">
 <header class="top">
   <div class="brand">
     <span class="logo">⇄</span>
@@ -36,32 +36,17 @@
   </section>
 
   <div id="workspace" class="hidden">
-    <!-- library first: it is the thing you are actually here for -->
+    <!-- library summary: the photos themselves live on the wall page, so the
+         home page stays quiet no matter how many files are in the library -->
     <section class="card lib" id="libCard">
       <div class="row between lib-head">
         <div class="lib-title">
           <h2><span class="step">②</span> 资料库 <span id="libCount" class="muted-note"></span></h2>
-          <p class="hint lib-sub">点缩略图放大预览，视频可直接播放；勾选后可一次下载多个。</p>
+          <p class="hint lib-sub">预览、批量选择与灯箱播放都在照片墙页面完成，这里只做概览。</p>
         </div>
-        <div class="row toolbar">
-          <label class="check-inline">
-            <input type="checkbox" id="selectAll" disabled>
-            <span>全选</span>
-          </label>
-          <button id="invertBtn" class="btn ghost small" disabled>反选</button>
-          <button id="refreshBtn" class="btn ghost small">刷新</button>
-        </div>
+        <a id="wallLink" class="btn primary wall-entry" href="/gallery">打开照片墙 →</a>
       </div>
-      <div id="fileList" class="grid" aria-live="polite"></div>
-      <!-- in the card normally; pins to the viewport bottom once the library
-           has scrolled out of view (app.js toggles .sel-pinned / .hidden) -->
-      <div id="selBar" class="selbar hidden">
-        <span id="selText" class="sel-text"></span>
-        <div class="row">
-          <button id="selClearBtn" class="btn ghost small">取消选择</button>
-          <button id="selDownloadBtn" class="btn primary">下载选中</button>
-        </div>
-      </div>
+      <div id="libEmpty" class="list-empty hidden">资料库为空。上传一张照片或一段视频试试。</div>
     </section>
 
     <!-- upload -->
@@ -94,29 +79,6 @@
   <p>纯前端 SHA-256 校验 · 零第三方依赖 · 明文 HTTP（请走可信隧道，勿在公网裸奔）</p>
   <p>画质说明：预览与原图共用一份文件，不解码、不重编码、不缩放、不压缩、不改 EXIF/元数据 —— <b>与原文件字节完全相同</b>。</p>
 </footer>
-
-<!-- lightbox: built once from this template by app.js -->
-<template id="lightboxTpl">
-  <div class="lb" role="dialog" aria-modal="true" aria-label="媒体预览">
-    <div class="lb-backdrop" data-lb="bg"></div>
-    <button class="lb-nav lb-prev" data-lb="prev" aria-label="上一张" title="上一张 (←)">‹</button>
-    <button class="lb-nav lb-next" data-lb="next" aria-label="下一张" title="下一张 (→)">›</button>
-    <figure class="lb-stage">
-      <img class="lb-img hidden" alt="" draggable="false">
-      <video class="lb-video hidden" controls playsinline preload="metadata"></video>
-      <div class="lb-fallback hidden"></div>
-      <div class="lb-spinner" aria-hidden="true"></div>
-    </figure>
-    <div class="lb-bar">
-      <div class="lb-title"><span class="lb-name"></span><span class="lb-sub"></span></div>
-      <div class="row">
-        <label class="check-inline lb-pick"><input type="checkbox" data-lb="pick"><span>选中</span></label>
-        <button class="btn ghost small" data-lb="download">下载并校验</button>
-        <button class="btn ghost small lb-close" data-lb="close" aria-label="关闭" title="关闭 (Esc)">✕</button>
-      </div>
-    </div>
-  </div>
-</template>
 
 <script src="/sha256.js"></script>
 <script src="/app.js"></script>

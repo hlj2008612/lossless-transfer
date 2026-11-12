@@ -198,95 +198,17 @@ input[type=password]:focus, input[type=text]:focus{
 .bar > i{display:block; height:100%; width:0; background:var(--accent); transition:width .12s}
 .hash{font:11px/1.5 var(--mono); color:var(--muted); margin-top:8px; word-break:break-all}
 
-/* ---- media grid --------------------------------------------------------- */
+/* ---- library entry (home page) ------------------------------------------ */
+/* The photos themselves live on /gallery (photo wall). The home page only
+   shows how many there are plus the way in, so it stays calm at any count. */
 .lib{position:relative}
-.lib-head{margin-bottom:4px}
-.toolbar{gap:6px}
-.check-inline{display:inline-flex; align-items:center; gap:6px; font-size:12.5px; color:var(--fg-2); cursor:pointer; padding:0 4px}
-.check-inline input{accent-color:var(--accent); width:15px;height:15px; margin:0; cursor:pointer}
-.grid{
-  display:grid; gap:12px; margin-top:12px;
-  grid-template-columns:repeat(auto-fill, minmax(158px, 1fr));
+.lib-head{margin-bottom:4px; align-items:center}
+.wall-entry{
+  flex:0 0 auto; padding:10px 18px; font-size:13.5px; border-radius:999px;
+  text-decoration:none; box-shadow:0 6px 18px rgba(31,111,235,.22);
 }
-.grid.empty{display:block}
+.wall-entry:hover{filter:brightness(1.06)}
 .list-empty{color:var(--muted); font-size:13px; padding:22px 0; text-align:center}
-
-.card-item{
-  position:relative; background:var(--surface); border:1px solid var(--line);
-  border-radius:var(--radius-sm); overflow:hidden;
-  transition:border-color .15s, box-shadow .15s;
-}
-.card-item:hover{border-color:var(--line-strong); box-shadow:var(--shadow)}
-.card-item.is-selected{border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft)}
-.card-fig{
-  position:relative; aspect-ratio:4 / 3; background:var(--surface-2); overflow:hidden;
-}
-.card-thumb{
-  display:block; width:100%; height:100%; object-fit:cover; opacity:0;
-  transition:opacity .25s, filter .25s, transform .25s;
-}
-.thumb-loaded .card-thumb{opacity:1}
-/* The camera's EXIF thumbnail is a bare JPEG with no orientation tag of its
-   own, so the grid applies the main file's EXIF 0x0112 itself. The card is a
-   fixed 4:3 box, which is why a 90/270 turn needs the 4/3 scale to cover it
-   again (5/7 are the rare transposed variants). */
-.card-item[data-orient="2"] .card-thumb{transform:scaleX(-1)}
-.card-item[data-orient="3"] .card-thumb{transform:rotate(180deg)}
-.card-item[data-orient="4"] .card-thumb{transform:scaleY(-1)}
-.card-item[data-orient="5"] .card-thumb{transform:rotate(90deg) scaleY(-1) scale(1.3334)}
-.card-item[data-orient="6"] .card-thumb{transform:rotate(90deg) scale(1.3334)}
-.card-item[data-orient="7"] .card-thumb{transform:rotate(270deg) scaleY(-1) scale(1.3334)}
-.card-item[data-orient="8"] .card-thumb{transform:rotate(270deg) scale(1.3334)}
-/* the placeholder (a pulsing "照片" tile) sits above the not-yet-decoded <img>
-   and fades out as the picture fades in */
-.thumb-loaded .card-ph{opacity:0; transition:opacity .25s}
-.thumb-loaded.is-partial .card-thumb{filter:blur(14px) saturate(.8); transform:scale(1.06)}
-.card-item.thumb-unsupported .card-fig{background:repeating-linear-gradient(135deg,var(--surface-2) 0 10px,var(--surface) 10px 20px)}
-.card-item.is-loading .card-ph{animation:ph-pulse 1.4s ease-in-out infinite}
-@keyframes ph-pulse{50%{opacity:.45}}
-.card-ph{
-  position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
-  justify-content:center; gap:4px; color:var(--muted);
-}
-.card-ph-icon{font-size:22px; line-height:1}
-.card-ph-kind{font-size:11.5px}
-.card-badge{
-  position:absolute; left:8px; bottom:8px; z-index:2;
-  font-size:11px; padding:2px 8px; border-radius:999px;
-  background:rgba(0,0,0,.62); color:#fff; backdrop-filter:blur(4px);
-  pointer-events:none;
-}
-.card-item:not(.kind-image) .card-fig{display:flex; align-items:center; justify-content:center}
-.card-item:not(.kind-image) .card-ph{position:relative; inset:auto; width:100%; height:100%}
-/* video poster slides over the placeholder once a frame has painted */
-.card-poster{
-  position:absolute; inset:0; z-index:1; width:100%; height:100%;
-  object-fit:cover; background:transparent; opacity:0; pointer-events:none;
-  transition:opacity .3s;
-}
-.has-still .card-poster{opacity:1}
-.has-still .card-ph{opacity:0; transition:opacity .3s}
-.card-open{
-  position:absolute; inset:0; z-index:1; border:0; padding:0; margin:0; cursor:zoom-in;
-  background:transparent; -webkit-tap-highlight-color:transparent;
-}
-.card-open:focus-visible{outline:2px solid var(--accent); outline-offset:-2px}
-.pick{
-  position:absolute; top:6px; left:6px; z-index:3; padding:5px; border-radius:7px;
-  background:rgba(255,255,255,.82); display:grid; place-items:center; cursor:pointer;
-  box-shadow:0 1px 3px rgba(0,0,0,.18);
-}
-.pick input{width:16px;height:16px;margin:0; accent-color:var(--accent); cursor:pointer}
-.is-selected .pick{background:var(--accent)}
-.is-selected .pick input{accent-color:#fff}
-.card-info{padding:9px 10px 0}
-.card-name{
-  font-size:12.5px; font-weight:600; white-space:nowrap; overflow:hidden;
-  text-overflow:ellipsis; color:var(--fg);
-}
-.card-meta{font-size:11.5px; color:var(--muted); margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-.card-acts{display:flex; gap:6px; padding:8px 10px 10px}
-.card-acts .btn{flex:1; padding:5px 8px; font-size:12px}
 
 /* ---- selection bar ------------------------------------------------------ */
 /* Sits at the end of the library card (where the selection is made); once
@@ -419,7 +341,6 @@ body.lb-open{overflow:hidden}
   h1 small{display:none}
   .brand p{white-space:normal}
   .logo{width:34px;height:34px;font-size:17px}
-  .grid{grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px}
   .lib-head{align-items:flex-start}
   .lb{padding:0}
   .lb-nav{display:none}
