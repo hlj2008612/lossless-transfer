@@ -1,0 +1,46 @@
+# Normalise line endings at the repository level.
+#
+# The project runs on Windows (PowerShell launchers) and on Linux/macOS (bash
+# launchers); a CRLF shell script is not just ugly, it does not run at all:
+# the kernel reads the shebang as "/usr/bin/env bash\r" and reports
+# "bad interpreter". Git's autocrlf setting rewrites text on checkout *and* on
+# `git archive`, so the rule has to live here rather than in each machine's
+# configuration.
+#
+# Every text file is stored with LF in the repository; working-tree conversion
+# is then decided per platform by git itself.
+
+* text=auto
+
+*.py    text eol=lf
+*.sh    text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.ini   text eol=lf
+*.toml  text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+Dockerfile      text eol=lf
+
+# Certificates and keys are text, but must never be touched by filters.
+*.pem   text eol=lf
+*.crt   text eol=lf
+*.key   text eol=lf
+
+# Binary payloads: never convert, never diff as text.
+*.jpg   binary
+*.jpeg  binary
+*.png   binary
+*.gif   binary
+*.webp  binary
+*.mp4   binary
+*.mov   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
