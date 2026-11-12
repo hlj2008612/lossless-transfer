@@ -344,7 +344,9 @@ body.has-selbar{padding-bottom:92px}
   .pick{width:24px; height:24px}
   .lb-nav{display:none}
 }
-@media (max-width:420px){
+/* Only the narrowest phones stack the two actions: at 390 px they still fit in
+   one row, which keeps the card (and therefore the wall) compact. */
+@media (max-width:360px){
   .card-acts{flex-direction:column}
   .card-acts .btn{width:100%}
 }

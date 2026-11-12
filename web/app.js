@@ -178,8 +178,9 @@
       }
       var ws = $('workspace');
       if (ws) ws.classList.remove('hidden');
-      log('连接成功，服务端 chunk_size=' + serverChunk, 'ok');
-      if (!tokenRequired && !isGallery) {
+      // On the wall page the badge already says "已连接"; a toast on every load
+      // would just sit on top of the photos.
+      if (!isGallery) log('连接成功，服务端 chunk_size=' + serverChunk, 'ok');      if (!tokenRequired && !isGallery) {
         log('该共享文件夹为开放模式：任何人打开此地址均可上传/下载/删除。', 'warn');
       }
       await refresh();
