@@ -95,8 +95,10 @@
 │       └── test_key.pem
 └── scripts/
     ├── verify_transfer.py          # 独立校验脚本：真实 CLI 双进程，出 38/38 报告
-    ├── gen_cert.ps1                # 零依赖自签证书生成器（PowerShell 7+ / .NET）
-    └── start_web.ps1               # 方案 A 一键启动：缺证书自动生成 + 原生 HTTPS 服务
+    ├── gen_cert.sh                 # 零依赖自签证书生成器（Linux / macOS，只需 openssl）
+    ├── gen_cert.ps1                # 同上，Windows（PowerShell 7+ / .NET）
+    ├── start_web.sh                # 一键启动（Linux / macOS）：缺证书自动生成 + 原生 HTTPS
+    └── start_web.ps1               # 同上，Windows
 ```
 
 关键实现位置（行号随版本可能微调，可用 `--help` 与 `grep` 定位）：
@@ -113,7 +115,7 @@
 | 离线双文件比对 / 生成清单 | `run_verify()` / `run_manifest()` |
 | 网页版 HTTP 服务 / 路由 / 令牌鉴权 | `web_transfer.py` `class Handler` / `Config` |
 | 原生 HTTPS（内地节点跨网必需） | `web_transfer.py` `build_tls_context()` / `main()` 的 `--tls-cert/--tls-key` |
-| 自签证书生成（零依赖） / 方案 A 一键启动 | `scripts/gen_cert.ps1` / `scripts/start_web.ps1` |
+| 自签证书生成（零依赖） / 一键启动 | `scripts/gen_cert.sh` + `start_web.sh`（Linux/macOS）／`gen_cert.ps1` + `start_web.ps1`（Windows） |
 | 网页端分块 + 校验 + 上传 / 下载 | `web/app.js` `buildManifest()` / `uploadFile()` / `downloadFile()` |
 | 浏览器端纯 JS 增量 SHA-256 | `web/sha256.js` `class Sha256` / `sha256Hex()` |
 
@@ -182,6 +184,58 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Open -Dir shared
 - `/api/info` 返回 `"token_required": false`。
 
 > ⚠️ **开放模式 = 没有门锁**：任何知道公网地址的人都能往这个文件夹写东西、下载里面的文件、甚至删除。只在你清楚风险时使用（例如临时给家人传照片、用完就停）。`--no-auth` 与 `--token` 不能同时给。
+
+### 在 Linux / macOS 上运行（bash）
+
+Windows 用 PowerShell 脚本，Linux / macOS 用等价的 bash 脚本，参数一一对应：
+
+| 用途 | Windows | Linux / macOS |
+| --- | --- | --- |
+| 一键启动 | `pwsh -NoProfile -File .\scripts\start_web.ps1 -Open -Dir shared` | `./scripts/start_web.sh --open --dir shared` |
+| 生成证书 | `pwsh -File .\scripts\gen_cert.ps1 -OutDir .\tls -DnsNames localhost,127.0.0.1` | `./scripts/gen_cert.sh --out-dir ./tls --dns localhost,127.0.0.1` |
+| 解释器 | `py -3` | `python3`（可用 `PYTHON_EXE=` 覆盖） |
+
+首次使用：
+
+```bash
+sudo apt install -y python3 openssl      # python3 基本都自带，openssl 用于自签证书
+sudo apt install -y python3-pil          # 可选：装了才有清晰预览；不装会退回 160×120 缩略图
+chmod +x scripts/*.sh                    # 从 zip 解压丢了可执行位时执行一次
+./scripts/start_web.sh --open --dir shared
+```
+
+Linux / macOS 特有的注意点：
+
+- **Pillow 建议用发行版包**：Ubuntu 24.04+ 的系统 Python 受 PEP 668 保护，`pip install pillow` 会被拒绝；`sudo apt install python3-pil` 直接生效。想用更新版本再建虚拟环境：`python3 -m venv .venv && . .venv/bin/activate && pip install pillow`，随后 `PYTHON_EXE=.venv/bin/python ./scripts/start_web.sh ...`。
+- **换行符**：`git clone` 在 Linux 上得到 LF，正常。**不要**把 Windows 侧的 CRLF 副本直接拷过去，否则 `.sh` 会报 `bad interpreter: /usr/bin/env bash^M`；必须拷贝时用 `git archive` 打包，或 `sed -i 's/\r$//' scripts/*.sh`。
+- **可执行位**：仓库中 `.sh` 已带可执行位；`git archive` / `git clone` 会保留，zip 解压可能丢失（`chmod +x` 或直接 `bash scripts/...`）。
+- **文件权限**：CLI 传输会记录并恢复 `mode`。Linux→Linux 权限位可原样还原；从 Windows 发来的文件没有 POSIX 权限位，接收端会落成 `0o644` 这类安全默认值。
+- **时间戳精度**：`os.utime(ns=...)` 在 ext4 / xfs / btrfs 上是纳秒级；FAT/exFAT 与部分网络盘只有 1–2 秒精度，mtime 可能有微小偏差（内容 SHA-256 不受影响）。
+- **监听地址与防火墙**：脚本默认 `--host 127.0.0.1`（配合隧道）。要同网段直连就改 `--host 0.0.0.0`，并放行端口：`sudo ufw allow 8765/tcp`。
+- **开机自启（可选）**：`.sh` 是前台进程，需要常驻时用 systemd：
+
+```ini
+# /etc/systemd/system/lossless-web.service
+[Unit]
+Description=lossless-transfer web
+After=network.target
+
+[Service]
+Type=simple
+User=mqm
+WorkingDirectory=/home/mqm/lossless-transfer
+Environment=PYTHON_EXE=/usr/bin/python3
+ExecStart=/home/mqm/lossless-transfer/scripts/start_web.sh --open --dir shared
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now lossless-web
+journalctl -u lossless-web -f        # 看 ACCESS TOKEN 与访问日志
+```
 
 ### 本机 / 局域网快速体验
 **接收端（跑服务端，先启动）**

@@ -1144,7 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dir", default=_env("LT_DIR", "shared"),
                    help="the web library folder: files visible on the page "
                         "(default $LT_DIR, or ./shared - the same default as "
-                        "scripts/start_web.ps1)")
+                        "scripts/start_web.sh and scripts/start_web.ps1)")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
     p.add_argument("--token", default=None,
