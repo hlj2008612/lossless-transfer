@@ -362,30 +362,122 @@
   }
 
   // ---- download -----------------------------------------------------------
-  // Unchanged lossless path: manifest -> every chunk -> SHA-256 of each chunk
-  // and of the whole file -> Blob -> save. `btn` is optional (batch downloads
-  // drive the same function without an individual card button).
+  // Same lossless path as before - manifest, every chunk, per-chunk SHA-256,
+  // whole-file SHA-256, then Blob -> save - but the chunks are fetched
+  // concurrently. A TCP tunnel charges one round trip per request, so a file
+  // with 3 chunks used to spend 3 RTTs waiting; with 3 lanes in flight the link
+  // stays busy instead of idling between requests.
+  //
+  // Order is the one thing that cannot be parallelised: SHA-256 is incremental,
+  // so bytes must be folded in sequence. Chunks land in a slot array, and a
+  // moving cursor hashes whatever contiguous run has already arrived - a chunk
+  // that overtakes its predecessor simply waits in its slot.
+  var DL_PARALLEL = 3;            // chunks in flight (Chrome allows 6 per host)
+  var DL_RETRIES = 2;             // transient failures per chunk before aborting
+  var DL_BIG_BYTES = 512 << 20;   // above this the whole file sits in RAM: warn
+
+  function sleep(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  // One chunk, checked against BOTH the manifest and the X-Chunk-Sha256 header.
+  // Bad bytes are tagged .integrity: retrying them would only re-download the
+  // same corruption, so they abort the transfer instead of consuming a retry.
+  async function fetchVerifiedChunk(name, i, want, signal) {
+    var r = await api('/api/download/chunk?name=' + qs(name) + '&index=' + i,
+                      { signal: signal });
+    var bytes = new Uint8Array(r.body);
+    var got = LTSha256.sha256Hex(bytes);
+    if (got !== want || got !== r.res.headers.get('X-Chunk-Sha256')) {
+      var err = new Error('分块 ' + i + ' SHA-256 不一致，已中止下载');
+      err.integrity = true;
+      throw err;
+    }
+    return bytes;
+  }
+
+  async function fetchChunkWithRetry(name, i, want, signal) {
+    var lastErr = null;
+    for (var attempt = 0; attempt <= DL_RETRIES; attempt++) {
+      try {
+        return await fetchVerifiedChunk(name, i, want, signal);
+      } catch (e) {
+        // A wrong hash, a cancelled request or an auth failure is final.
+        if (e && (e.integrity || e.name === 'AbortError' || e.status === 401)) {
+          throw e;
+        }
+        lastErr = e;
+        if (attempt < DL_RETRIES) await sleep(250 * (attempt + 1));  // back off
+      }
+    }
+    throw lastErr;
+  }
+
   async function downloadFile(name, btn) {
     if (busy) { log('已有传输在进行，请稍候', 'warn'); return false; }
     busy = true;
     if (btn) btn.disabled = true;
     var ok = false;
+    var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
     try {
       log('下载 ' + name + '：取清单', '');
       var m = (await api('/api/download/manifest?name=' + qs(name))).body;
-      var whole = new LTSha256.Sha256();
-      var parts = [];
-      for (var i = 0; i < m.chunks.length; i++) {
-        var r = await api('/api/download/chunk?name=' + qs(name) + '&index=' + i);
-        var bytes = new Uint8Array(r.body);
-        var got = LTSha256.sha256Hex(bytes);
-        if (got !== m.chunks[i].sha256 || got !== r.res.headers.get('X-Chunk-Sha256')) {
-          throw new Error('分块 ' + i + ' SHA-256 不一致，已中止下载');
-        }
-        whole.update(bytes);
-        parts.push(bytes);
-        if (btn) btn.textContent = '下载中 ' + Math.round((i + 1) / m.chunks.length * 100) + '%';
+      var total = m.chunks.length;
+      if (m.size > DL_BIG_BYTES) {
+        // The Blob is assembled in memory before the browser writes it out, so
+        // a 2 GB video needs 2 GB of free RAM. Say so before the transfer, not
+        // after it fails.
+        log(name + '：' + fmtSize(m.size) + ' 较大，下载时整份文件会先驻留内存再整体校验，' +
+            '请确认可用内存足够（约 ' + fmtSize(m.size) + '）', 'warn');
       }
+      log('下载 ' + name + '：' + total + ' 块 · ' +
+          Math.min(DL_PARALLEL, Math.max(1, total)) + ' 路并行', '');
+
+      var whole = new LTSha256.Sha256();
+      var parts = new Array(total);
+      var arrived = new Uint8Array(total);
+      var cursor = 0;      // next chunk index to hand to a lane
+      var sealed = 0;      // next index the hash may consume
+      var doneCount = 0;
+
+      function fold() {    // hash every contiguous run that is ready, in order
+        while (sealed < total && arrived[sealed]) {
+          whole.update(parts[sealed]);
+          arrived[sealed] = 0;
+          sealed += 1;
+        }
+      }
+
+      async function lane() {
+        while (!ctrl || !ctrl.signal.aborted) {
+          var i = cursor++;
+          if (i >= total) return;
+          var bytes = await fetchChunkWithRetry(
+            name, i, m.chunks[i].sha256, ctrl ? ctrl.signal : undefined);
+          parts[i] = bytes;
+          arrived[i] = 1;
+          doneCount += 1;
+          fold();          // releases the buffer to the hash as soon as possible
+          if (btn) {
+            btn.textContent = '下载中 ' + Math.round(doneCount / total * 100) + '%';
+          }
+        }
+      }
+
+      var lanes = Math.min(DL_PARALLEL, Math.max(1, total));
+      var pool = [];
+      for (var w = 0; w < lanes; w++) pool.push(lane());
+      try {
+        await Promise.all(pool);
+      } catch (e) {
+        if (ctrl) ctrl.abort();      // one bad chunk stops every sibling lane
+        throw e;
+      }
+      fold();
+      if (sealed !== total) {
+        throw new Error('仍有分块未到齐（' + sealed + '/' + total + '）');
+      }
+
       var local = whole.hex();
       if (local !== m.sha256) {
         throw new Error('整文件 SHA-256 与服务端清单不一致（' + local + ' != ' + m.sha256 + '）');

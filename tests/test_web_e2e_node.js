@@ -238,6 +238,62 @@ async function waitReady(url, child, timeoutMs) {
     ok(dlWhole.hex() === m.sha256, 'reassembled download JS SHA-256 == source');
     ok(Buffer.concat(parts).equals(data), 'downloaded bytes == original bytes');
 
+    // ---- parallel chunk download (3 lanes), same invariants ----
+    // Mirrors the lane/fold algorithm in web/app.js downloadFile(): chunks are
+    // requested from a shared cursor, buffered in slots, and folded into the
+    // hash only when the contiguous run reaches them. Three lanes keep three
+    // requests in flight, which is the point of the change; the assertions are
+    // the same ones the sequential path makes, so a parallel run can never be
+    // "faster but less exact".
+    {
+      const total = dm.chunks.length;
+      const slots = new Array(total);
+      const arrived = new Uint8Array(total);
+      const parWhole = new LT.Sha256();
+      let cursor = 0;
+      let sealed = 0;
+      let done = 0;
+      const fold = () => {
+        while (sealed < total && arrived[sealed]) {
+          parWhole.update(slots[sealed]);
+          arrived[sealed] = 0;
+          sealed += 1;
+        }
+      };
+      const lane = async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= total) return;
+          const c = dm.chunks[i];
+          const r = await api(url, '/api/download/chunk?name=' +
+                              encodeURIComponent(name) + '&index=' + i);
+          const bytes = r.body;
+          if (LT.sha256Hex(bytes) !== c.sha256) {
+            throw new Error('chunk ' + i + ' failed its hash check');
+          }
+          slots[i] = bytes;
+          arrived[i] = 1;
+          done += 1;
+          fold();                     // the next contiguous run is hashed now
+        }
+      };
+      await Promise.all([lane(), lane(), lane()]);
+      ok(sealed === total,
+         'parallel download: every chunk folded in order (' + sealed + '/' + total + ')');
+      ok(done === total, 'parallel download: each chunk fetched exactly once');
+      ok(parWhole.hex() === m.sha256, 'parallel download: whole-file SHA-256 == source');
+      ok(Buffer.concat(slots.map(b => Buffer.from(b))).equals(data),
+         'parallel download: bytes == original bytes');
+
+      // One flipped byte must be rejected by the very check the lanes run, so
+      // an out-of-order arrival can never slip corrupt data into the Blob.
+      const probe = Uint8Array.from((await api(url, '/api/download/chunk?name=' +
+        encodeURIComponent(name) + '&index=0')).body);
+      probe[0] ^= 0xff;
+      ok(LT.sha256Hex(probe) !== dm.chunks[0].sha256,
+         'parallel download: a flipped byte fails the chunk check');
+    }
+
     // ---- bigInt mtime string round-trips as a real timestamp ----
     const list = (await api(url, '/api/list')).body;
     const entry = list.files.find(f => f.name === name);

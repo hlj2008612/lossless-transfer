@@ -208,6 +208,8 @@ Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一�
 - **上传**：把照片 / 视频拖进虚线框（或点「选择文件」，可多选）。浏览器先用纯 JS 逐块算 SHA-256 → 分块上传 → 服务端逐块复算校验 → 整文件复算 → 页面显示「✓ 已验证 · 字节完全一致」。
 - **预览**：资料库是缩略图网格——照片直接出缩略、视频出首帧（滚到可见才加载，最多 4 个并发）。缩略图优先用**相机写在 EXIF 里的那段缩略图**（`/api/thumb`，通常 10–30 KB，一屏 10 MB 原图也只花几十 KB）；这段缩略图本身不带 EXIF，所以网格按主文件的 `Orientation` 自行旋转，竖拍照片不会躺倒。没有内嵌缩略图时退回读原文件头部，再不行才整份读取（超过 8 MiB 的图不整份拉取，卡片显示「点开查看」）。点卡片打开灯箱看大图 / 播放视频（`Esc` 关闭、`←` `→` 切换、视频可拖进度条）：大图加载期间先放大模糊显示已有缩略图，并在底部显示「载入 N%」。预览全部只读原文件字节，**不生成也不保存任何派生图**，所以预览永远不会改动原文件。
 - **下载**：在「资料库」点单张卡片的「下载」，或勾选多张后点「下载选中（N）」，浏览器逐块 GET、逐块用 JS 校验、再整文件校验，一致才保存到本地。多选是逐个下载，每一项都独立做 SHA-256 校验。
+- **下载并行化**：分块**3 路并发**取回（`web/app.js` 的 `DL_PARALLEL`），因为隧道上每个请求都要一次往返，串行取块等于把 RTT 乘以块数。乱序到达的块先进槽位，等前序补齐后再**按顺序喂给增量 SHA-256**——顺序不可并行，这是哈希本身的约束，不是实现妥协。任一块在 2 次重试后仍失败（或哈希不一致）会立刻中止整个传输，不会产出半成品文件。实测 9.72 MB / 3 块：串行 28.3 s → 3 路 13.5 s（2.09×，字节完全一致）。
+- **大文件内存**：下载时整份文件会先拼成 Blob 再写盘，内存占用≈文件大小；超过 512 MB 会在日志里先给一条提醒（`DL_BIG_BYTES`），避免 2 GB 视频在低内存机器上莫名失败。
 - **浏览器认不出的格式**：CR3、NEF 等 RAW 只显示文件图标（`/api/preview` 返回 `415`），照常可以下载校验；HEIC/HEIF 能否显示取决于浏览器。
 - **断点续传**：上传到一半中断（关页面 / 断网），重新选同一个文件，`POST /api/upload/init` 会返回 `next_index`，浏览器只补未验的块。
 - **列表 / 删除**：资料库列出服务端 `shared/` 里的文件，可删除（CLI 的 `receive` 子命令写的是 `received/`，两者互不干扰）。
@@ -290,7 +292,7 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 ```bash
 python3 -m unittest discover -s tests -v      # 33 个测试（11 CLI + 22 网页 HTTP/HTTPS/开放模式 API）
 node tests/test_sha256_js.js                   # 纯 JS SHA-256 对拍 Node crypto：51 cases
-node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e：约 135 checks（随分块数/幂等跳过浮动）
+node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e：约 140 checks（随分块数/幂等跳过浮动）
 ```
 
 `test_web_e2e_node.js` 用**实际的 `web/sha256.js`** 造清单、用 `fetch` + `Uint8Array` 发块（与 `app.js` 一致），起一个真实 `web_transfer.py`，证明「服务端独立 SHA-256 == 浏览器 JS SHA-256（byte-exact, lossless）」、下载重组字节一致、篡改块被拒；不依赖 `crypto.subtle`。不设环境变量时它会自己拉起服务端（明文 HTTP）；设 `LT_E2E_URL` / `LT_E2E_TOKEN` 可指向一个已运行的真实隧道，URL 为 `https://` 时还会断言服务端 `tls:true`（配合 `NODE_EXTRA_CA_CERTS` 信任自签证书）。Python 套件里的 `WebTransferTLS` 会再起一个**原生 HTTPS 服务**，用公开的测试证书跑完整分块上传 / 下载 / 字节比对。`test_web_transfer.py` 中另有 `build_tls_context()` 对缺失证书 / 不成对参数的拒绝测试。
