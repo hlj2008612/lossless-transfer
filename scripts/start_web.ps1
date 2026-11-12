@@ -44,7 +44,12 @@ param(
     [int]      $ChunkSize      = 4194304,
     [ValidateRange(1, 3650)]
     [int]      $Days           = 365,
-    [switch]   $RegenerateCert
+    [switch]   $RegenerateCert,
+    # Our TLS is terminated in front of us (SakuraFrp "Auto HTTPS", Caddy, any
+    # reverse proxy): the tunnel speaks HTTPS to the browser and plain HTTP to
+    # us, so we must NOT serve TLS ourselves - otherwise the browser sees a
+    # certificate error from inside the tunnel.
+    [switch]   $BehindTls
 )
 $ErrorActionPreference = 'Stop'
 
@@ -54,8 +59,10 @@ $certPath = Join-Path $tlsDir 'cert.pem'
 $keyPath  = Join-Path $tlsDir 'key.pem'
 $genScript = Join-Path $PSScriptRoot 'gen_cert.ps1'
 
-# 1. Ensure a certificate exists (regenerate on demand).
-if ($RegenerateCert -or -not (Test-Path -LiteralPath $certPath) -or
+# 1. Ensure a certificate exists (skipped when someone else terminates TLS).
+if ($BehindTls) {
+    Write-Host '==> -BehindTls: serving plain HTTP; the proxy/tunnel provides HTTPS' -ForegroundColor Cyan
+} elseif ($RegenerateCert -or -not (Test-Path -LiteralPath $certPath) -or
     -not (Test-Path -LiteralPath $keyPath)) {
     Write-Host '==> Generating self-signed TLS certificate ...' -ForegroundColor Cyan
     & $genScript -OutDir $tlsDir -DnsNames $DnsNames -Days $Days -Force
@@ -72,21 +79,32 @@ $pyArgs = @('-3', (Join-Path $root 'web_transfer.py'),
             '--host', '127.0.0.1',
             '--port', [string]$Port,
             '--dir', (Join-Path $root $Dir),
-            '--chunk-size', [string]$ChunkSize,
-            '--tls-cert', $certPath,
-            '--tls-key',  $keyPath)
+            '--chunk-size', [string]$ChunkSize)
+if (-not $BehindTls) {
+    $pyArgs += @('--tls-cert', $certPath, '--tls-key', $keyPath)
+}
 if ($Token) { $pyArgs += @('--token', $Token) }
 if ($Open)  { $pyArgs += @('--no-auth') }
 
 $py = if ($env:PYTHON_EXE) { $env:PYTHON_EXE } else { 'py' }
 
 Write-Host ''
-Write-Host '==> Starting lossless-transfer WEB (native HTTPS) ...' -ForegroundColor Green
+if ($BehindTls) {
+    Write-Host '==> Starting lossless-transfer WEB (plain HTTP behind a TLS proxy) ...' -ForegroundColor Green
+} else {
+    Write-Host '==> Starting lossless-transfer WEB (native HTTPS) ...' -ForegroundColor Green
+}
 Write-Host ('    ' + ($pyArgs -join ' ')) -ForegroundColor DarkGray
 Write-Host ''
-Write-Host ('    SakuraFrp TCP tunnel: local 127.0.0.1:' + $Port +
-            ' , Auto HTTPS = DISABLED') -ForegroundColor Yellow
-Write-Host '    Browser (other network): https://<公网地址>  (accept the self-signed cert once)' -ForegroundColor Yellow
+if ($BehindTls) {
+    Write-Host ('    Point the HTTP tunnel / reverse proxy at 127.0.0.1:' + $Port +
+                ' (SakuraFrp: tunnel type HTTP, "Auto HTTPS" ENABLED).') -ForegroundColor Yellow
+    Write-Host '    Browser: https://<your domain>  - certificate comes from the proxy, no warnings.' -ForegroundColor Yellow
+} else {
+    Write-Host ('    SakuraFrp TCP tunnel: local 127.0.0.1:' + $Port +
+                ' , Auto HTTPS = DISABLED') -ForegroundColor Yellow
+    Write-Host '    Browser (other network): https://<公网地址>  (accept the self-signed cert once)' -ForegroundColor Yellow
+}
 if ($Open) {
     Write-Host '    OPEN MODE: no token - anyone who opens the URL can upload/download/DELETE.' -ForegroundColor Red
 } else {
