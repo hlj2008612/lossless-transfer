@@ -191,14 +191,17 @@ python3 web_transfer.py --host 0.0.0.0 --port 8765 --dir ./shared --token 你自
 Windows 用 `py -3 web_transfer.py ...`。不传 `--token` 会**随机生成一个**并打印在启动日志里。加 `--tls-cert`/`--tls-key` 则改为原生 HTTPS（跨公网 / 内地节点必需，见下一节）。启动后终端会打印类似：
 
 ```
-  lossless-transfer  WEB  v1.3.0   (Python stdlib only)
+  lossless-transfer  WEB  v1.4.0   (Python stdlib + Pillow previews)
   Library dir  : D:\...\无损传输\shared
   Chunk size   : 4194304 bytes (4.0 MiB)
   Local URL    : http://127.0.0.1:8765     # 加了证书则是 https://
+  Previews     : rendered on demand (sharp cards); cached in ...\.lossless-web\previews
   ACCESS TOKEN : xxxxxxxxxxxxxxxxxxxxxx
   WARNING: plain HTTP; token and file bytes are NOT encrypted   # 明文模式才有
 ======================================================================
 ```
+
+> 没装 Pillow 时这一行会显示 `Python stdlib only` 并提示装 Pillow，功能照常，只是卡片用相机内嵌的 160×120 缩略图。装法：`pip install pillow`（或 `py -3 -m pip install pillow`）。
 
 **发送端（任何有浏览器的设备）**：打开 `http://<接收端IP>:8765` → 在「连接」卡片填入上面的 `ACCESS TOKEN` → 点「连接」。之后：
 
