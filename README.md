@@ -57,8 +57,9 @@
 | 纯静态前端（`web/` 三个文件） | 无需构建工具；浏览器原生 `fetch` / `Blob.slice().arrayBuffer()` 即可分块读原始字节 |
 | **自写纯 JS SHA-256** (`web/sha256.js`) | 普通 TCP 隧道 / 局域网常是明文 HTTP，属于**非安全上下文**，`window.crypto.subtle` 会被浏览器禁用；因此自带增量式 SHA-256，且避免把整个视频读进内存。开启 HTTPS 后浏览器原生 `crypto.subtle` 也可用，但本项目仍统一用自带实现，行为一致 |
 | 令牌鉴权 `X-LT-Token` | 隧道把端口暴露到公网，必须有一道口令（`hmac.compare_digest` 常量时间比对）；比 CLI 的「无认证」更进一步。`/api/preview` 额外接受只读的 `media_token`（查询参数 `t=`），因为 `<video>`/`<img>` 发不了自定义请求头；它不能调用任何其他接口 |
-| 预览 = 原文件原字节 | 缩略图与大图都直接读取原文件字节交给浏览器解码，服务端不生成、不缓存、不落盘任何派生图像（派生图一旦保存，就有被当成「原图」拿走的隐患）；视频用 `Range` 分段流式读取，拖进度条不会整段下载 |
+| 预览 = 三级显示链路 | ① 相机内嵌的 10–30 KB 缩略图（瞬时占位）；② 服务端按屏幕实际像素**按需渲染**的展示副本（`/api/image`，见下条）；③ 装不上 Pillow 时退回读原文件头部/整段流式读取。**下载走的永远是原始字节**，渲染产物只存在于 `.lossless-web/previews/`，调用删除接口也不会碰到原图 |
 | `/api/thumb` 取「相机自带」缩略图 | 相机 JPEG 的 EXIF 里本来就有一段 10–30 KB 的缩略图。服务端只从文件头部把**这段已有的字节**切出来返回（内存中转，不落盘、不解码、不重编码），因此一屏 10 MB 的原图在隧道上只花几十 KB 就能出图；没有内嵌缩略图就返回 `415`，前端再退回读原文件头部 |
+| `/api/image` 按需渲染（Pillow，可选） | 内嵌缩略图只有 160×120，在 350–700 px 的卡片上放大 2–4 倍必然发糊（实测同宽锐度差 5–9 倍）。于是首次请求时用 Pillow 解码 → `Image.draft()` 让 JPEG 解码器直接按 1/2–1/8 出图（32 MP 只需解 1/64 像素）→ 缩到目标边长 → 存成 q82 JPEG 落盘缓存，之后都是纯磁盘读。缺 Pillow 时该接口返回 `501`，前端自动回到旧链路，零依赖承诺只是降级、不会失效 |
 | HTTP/1.1 keep-alive | 隧道上每次请求都要重新 TCP + TLS 握手，代价远大于响应本身。开启连接复用后「首页 + 4 个静态文件 + 每个缩略图」共享一条连接；`Content-Length` 精确、流式短读/异常一律主动断连，避免 1.1 的分帧错位 |
 | 静态资源 `ETag` + `no-cache` | 重新加载时静态文件走 `304`（无 body），既有更新立刻生效，又不重复传 60 KB；缩略图与预览带 `max-age`，同一版本只下一次 |
 | **原生 HTTPS**（可选 `--tls-cert/--tls-key`） | 标准库 `ssl.SSLContext` 直接把监听 socket 包成 TLS；内地 SakuraFrp 节点按合规要求拦截明文 HTTP（返回 501），但放行 TLS 字节流，因此跨公网必须让链路是 HTTPS。配套 `scripts/gen_cert.ps1` 零依赖生成自签证书 |
@@ -265,7 +266,7 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 
 ### HTTP API（供二次开发）
 
-所有 `/api/*` 请求必须带 `X-LT-Token` 头；静态页面（`/`、`/index.html`、`/app.js`、`/app.css`、`/sha256.js`）无需令牌。**唯一例外是 `/api/preview`**：它额外接受查询参数 `t=<media_token>`，因为 `<video>` / `<img>` 无法自定义请求头；这个令牌只能用于预览，拿它调其他接口一律 `401`。
+所有 `/api/*` 请求必须带 `X-LT-Token` 头；静态页面（`/`、`/gallery`、`/index.html`、`/gallery.html`、`/app.js`、`/app.css`、`/gallery.css`、`/sha256.js`）无需令牌。**唯一例外是 `/api/preview`**：它额外接受查询参数 `t=<media_token>`，因为 `<video>` / `<img>` 无法自定义请求头；这个令牌只能用于预览，拿它调其他接口一律 `401`。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -273,6 +274,7 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 | GET | `/api/list` | 列出资料库文件（name / size / mtime_ns / kind=`image`\|`video`\|`other`） |
 | GET | `/api/preview?name=&index=` | **只读预览**：返回原文件原始字节（不解码、不转码），按扩展名给 `Content-Type`，支持 `Range`（`206` + `Accept-Ranges`，视频可拖进度）；未知 / 浏览器不认的格式（CR3、NEF、RAW…）→ `415`。`index` 可选，仅作客户端缓存键 |
 | GET | `/api/thumb?name=` | **内嵌缩略图**：从 JPEG 的 EXIF IFD1 里切出相机自己写入的那段缩略图（不生成、不重编码、不落盘），带 `ETag` + 7 天缓存，命中条件请求返回 `304`；响应头 `X-Thumb-Orientation` 给出主文件的 EXIF 方向（1–8），因为这段缩略图本身不带 EXIF，前端要据此旋转；文件没带缩略图 → `415`（此时前端退回 `/api/preview`，**不代表**该文件不能预览） |
+| GET | `/api/image?name=&w=` | **按需渲染的展示副本**（需要 Pillow）：把原图缩到最长边 `w`（默认 720，上限 2048）的 JPEG q82，首次请求生成并缓存到 `.lossless-web/previews/`，之后纯磁盘读；`ETag` 由 `(name, size, mtime, w)` 派生，条件请求走 `304`；照片墙卡片按屏幕像素密度取 320–1080，灯箱取 1600。非图片 → `415`，**没装 Pillow → `501`**（前端自动退回 `/api/thumb` + `/api/preview`） |
 | POST | `/api/upload/init` | 提交清单；返回 `status=upload` + `next_index`（或 `complete` 幂等跳过） |
 | POST | `/api/upload/chunk?name=&index=` | 上传一块原始字节，服务端逐块校验 SHA-256 |
 | POST | `/api/upload/complete` | 整文件复算 → 原子发布 → 恢复元数据 |
@@ -283,7 +285,7 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 ### 网页版测试
 
 ```bash
-python3 -m unittest discover -s tests -v      # 26 个测试（11 CLI + 15 网页 HTTP/HTTPS/开放模式 API）
+python3 -m unittest discover -s tests -v      # 33 个测试（11 CLI + 22 网页 HTTP/HTTPS/开放模式 API）
 node tests/test_sha256_js.js                   # 纯 JS SHA-256 对拍 Node crypto：51 cases
 node tests/test_web_e2e_node.js                # 浏览器真实代码路径 e2e：约 135 checks（随分块数/幂等跳过浮动）
 ```

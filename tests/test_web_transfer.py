@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -229,6 +230,56 @@ class WebTransferE2E(unittest.TestCase):
             self.assertIn(needle, b, path)
         st, _, _ = self.req("GET", "/nope.txt", token=None)
         self.assertEqual(st, 404)
+
+    @unittest.skipUnless(wt.HAS_PIL, "Pillow not installed")
+    def test_01b_rendered_preview(self):
+        """GET /api/image renders a display copy sized for the screen.
+
+        The card path used to be the camera's 160x120 EXIF thumbnail, which is
+        visibly soft at a 350-700 px card. This endpoint is the fix: decode
+        once, scale to the requested edge, cache on disk, serve from cache.
+        """
+        from PIL import Image
+
+        src = os.path.join(self.lib, "render-src.JPG")
+        Image.new("RGB", (1200, 800), (30, 120, 200)).save(
+            src, "JPEG", quality=92)
+        try:
+            st, h, body = self.req("GET", "/api/image?name=render-src.JPG&w=400")
+            self.assertEqual(st, 200, body[:300])
+            self.assertEqual(h.get("content-type"), "image/jpeg")
+            with Image.open(io.BytesIO(body)) as im:
+                self.assertLessEqual(max(im.size), 400)
+                self.assertGreater(min(im.size), 200)   # ratio preserved
+                self.assertEqual(im.size[0] > im.size[1], True)  # still landscape
+
+            # same request again: byte-identical cache hit
+            st2, h2, body2 = self.req("GET", "/api/image?name=render-src.JPG&w=400")
+            self.assertEqual(st2, 200)
+            self.assertEqual(body2, body)
+            self.assertIn("etag", h2)
+
+            # conditional request revalidates without a body
+            st3, _, _ = self.req("GET", "/api/image?name=render-src.JPG&w=400",
+                                 headers={"If-None-Match": h2["etag"]})
+            self.assertEqual(st3, 304)
+
+            # the rendered copy lives outside the shared listing
+            st4, _, listing = self.req("GET", "/api/list")
+            names = [f["name"] for f in json.loads(listing)["files"]]
+            self.assertNotIn("previews", names)
+
+            # token is still required, and only images can be rendered
+            st5, _, _ = self.req("GET", "/api/image?name=render-src.JPG&w=400",
+                                 token=None)
+            self.assertEqual(st5, 401)
+            st6, _, _ = self.req("GET", "/api/image?name=notes.txt&w=400")
+            self.assertEqual(st6, 415)
+        finally:
+            try:
+                os.remove(src)
+            except OSError:
+                pass
 
     def test_02_full_upload_is_byte_exact(self):
         data = sample_bytes(1000, seed=3)  # 16 chunks at 64 B

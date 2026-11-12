@@ -55,6 +55,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import lossless_transfer as lt
 
+# Optional image pipeline. Pillow lets /api/image render a display-sized copy on
+# demand (the same two-tier idea as the static photo-wall project, but computed
+# on first request instead of at build time). It is genuinely optional: without
+# Pillow every endpoint still works and cards fall back to the camera's own
+# EXIF thumbnail, so the zero-dependency story only degrades, it never breaks.
+try:  # pragma: no cover - exercised by whichever environment the tests run in
+    from PIL import Image
+    HAS_PIL = True
+    # A 32 MP camera frame is normal here; keep the decompression-bomb guard
+    # meaningful but above anything a real photo produces.
+    Image.MAX_IMAGE_PIXELS = 240_000_000
+except Exception:  # pragma: no cover
+    Image = None  # type: ignore[assignment]
+    HAS_PIL = False
+
 WEB_VERSION = "1.3.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
@@ -101,6 +116,16 @@ OTHER_TYPES = {
 # (Safari); everyone else falls back to the download button.
 OTHER_TYPES.update({".heic": "image/heic", ".heif": "image/heif"})
 
+# EXIF 0x0112 -> the transpose that makes the stored pixels upright.
+ORIENT_TRANSPOSE = {
+    2: "FLIP_LEFT_RIGHT", 3: "ROTATE_180", 4: "FLIP_TOP_BOTTOM",
+    5: "TRANSPOSE", 6: "ROTATE_270", 7: "TRANSVERSE", 8: "ROTATE_90",
+}
+PREVIEW_DEFAULT_W = 720        # card size on a 2x screen
+PREVIEW_MAX_W = 2048           # never render bigger than this for a browser
+PREVIEW_QUALITY = 82
+PREVIEW_CACHE_TTL = 30 * 86400  # drop rendered copies after a month
+
 
 class HTTPError(Exception):
     def __init__(self, status: int, message: str) -> None:
@@ -116,6 +141,9 @@ class Config:
         self.port = port
         self.dir = os.path.abspath(directory)
         self.staging = os.path.join(self.dir, ".lossless-web")
+        # Display copies rendered by /api/image (never inside the shared view of
+        # the folder: .lossless-web is already hidden from /api/list).
+        self.preview_cache = os.path.join(self.staging, "previews")
         self.chunk_size = chunk_size
         self.token = token
         self._locks: Dict[str, threading.Lock] = {}
@@ -124,6 +152,8 @@ class Config:
     def ensure_dirs(self) -> None:
         os.makedirs(self.dir, exist_ok=True)
         os.makedirs(self.staging, exist_ok=True)
+        if HAS_PIL:
+            os.makedirs(self.preview_cache, exist_ok=True)
 
     def lock_for(self, key: str) -> threading.Lock:
         with self._guard:
@@ -269,6 +299,68 @@ def jpeg_thumbnail(path: str) -> Tuple[Optional[bytes], int]:
                     return thumb, orientation
         pos += 2 + seg_len
     return None, 1
+
+
+def render_preview(src: str, out: str, want: int) -> None:
+    """Write a browser-sized JPEG copy of `src` to `out` (atomic).
+
+    `want` is the longest edge. The decode itself is the expensive part of a
+    32 MP frame, so `Image.draft()` asks the JPEG decoder for a 1/2, 1/4 or 1/8
+    scaled copy first - a 6960 px photo then decodes about 1/64 of the pixels.
+    EXIF orientation is applied explicitly (draft() may drop the tag), and the
+    alpha of a PNG/WebP source is flattened onto white rather than black.
+
+    Nothing here touches the stored file: this is a display copy only, and the
+    verified download path still streams the original bytes.
+    """
+    tmp = "%s.%d.tmp" % (out, os.getpid())
+    try:
+        with Image.open(src) as im:                       # type: ignore[union-attr]
+            try:
+                orient = int(im.getexif().get(0x0112, 1))
+            except Exception:
+                orient = 1
+            try:
+                im.draft("RGB", (want, want))             # JPEG-only fast path
+            except Exception:
+                pass
+            name = ORIENT_TRANSPOSE.get(orient)
+            if name:
+                table = getattr(Image, "Transpose", Image)
+                im = im.transpose(getattr(table, name))
+            if im.mode in ("RGBA", "LA", "P"):
+                rgba = im.convert("RGBA")
+                flat = Image.new("RGB", rgba.size, (255, 255, 255))
+                flat.paste(rgba, mask=rgba.split()[-1])
+                im = flat
+            elif im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.thumbnail((want, want), Image.LANCZOS)
+            im.save(tmp, "JPEG", quality=PREVIEW_QUALITY, optimize=True,
+                    progressive=True)
+        os.replace(tmp, out)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def prune_preview_cache(directory: str) -> None:
+    """Drop rendered copies that nothing has asked for in PREVIEW_CACHE_TTL."""
+    cutoff = time.time() - PREVIEW_CACHE_TTL
+    try:
+        entries = os.scandir(directory)
+    except OSError:
+        return
+    with entries:
+        for ent in entries:
+            try:
+                if ent.is_file() and ent.stat().st_mtime < cutoff:
+                    os.remove(ent.path)
+            except OSError:
+                continue
 
 
 def validate_manifest(obj: Any, cfg: Config) -> Dict[str, Any]:
@@ -545,6 +637,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._api_preview(q)
         if path == "/api/thumb" and method == "GET":
             return self._api_thumb(q)
+        if path == "/api/image" and method == "GET":
+            return self._api_image(q)
         if path == "/api/delete" and method == "POST":
             return self._api_delete()
         raise HTTPError(404, "unknown endpoint")
@@ -567,6 +661,10 @@ class Handler(BaseHTTPRequestHandler):
                             "video": sorted(VIDEO_TYPES)},
             # /api/thumb can answer with the JPEG's own EXIF thumbnail
             "thumb_ext": list(JPEG_EXTS),
+            # True when /api/image can render a display copy (Pillow present).
+            # False means cards keep using the 160x120 EXIF thumbnail.
+            "preview_pipeline": HAS_PIL,
+            "preview_max": PREVIEW_MAX_W,
         })
 
     def _api_list(self) -> None:
@@ -842,6 +940,71 @@ class Handler(BaseHTTPRequestHandler):
             "X-Thumb-Orientation": str(orientation),
             "X-Content-Type-Options": "nosniff",
         }, cache="private, max-age=604800")  # immutable for this (size, mtime)
+
+    # ---- API: rendered preview (Pillow) ------------------------------------
+    def _api_image(self, q) -> None:
+        """GET /api/image?name=...&w=720 -> a display-sized JPEG copy.
+
+        The camera's EXIF thumbnail is only 160x120: perfect as an instant
+        placeholder, visibly soft once a card is 350-700 CSS px wide. This
+        endpoint renders a copy at the size the screen actually needs (longest
+        edge `w`, quality 82), caches it under .lossless-web/previews/ and
+        serves it from disk afterwards - the dynamic counterpart of the
+        build-time thumb/full tiers the static photo wall ships.
+
+        `w` is clamped to PREVIEW_MAX_W. The cache key includes (size, mtime),
+        so re-uploading a name under the same hash never shows an old render.
+        501 means Pillow is not installed on this server: the UI then keeps
+        using /api/thumb and /api/preview exactly as before.
+        """
+        if not HAS_PIL:
+            raise HTTPError(501, "this server has no image pipeline "
+                                 "(Pillow is not installed)")
+        name = safe_name(self._qs(q, "name"))
+        raw_w = self._qs(q, "w") or str(PREVIEW_DEFAULT_W)
+        try:
+            want = int(raw_w)
+        except ValueError:
+            raise HTTPError(400, "w must be an integer")
+        want = max(64, min(want, PREVIEW_MAX_W))
+        kind, _ctype = media_type(name)
+        if kind != "image":
+            raise HTTPError(415, "only images can be rendered")
+        dest = os.path.join(self.cfg.dir, name)
+        if not os.path.isfile(dest):
+            raise HTTPError(404, "file not found")
+        st = os.stat(dest)
+        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+        digest = hashlib.sha256(
+            ("%s|%d|%d|%d" % (name, st.st_size, mtime_ns, want)).encode("utf-8")
+        ).hexdigest()[:32]
+        etag = '"p%s"' % digest
+        out = os.path.join(self.cfg.preview_cache, digest + ".jpg")
+        if self.headers.get("If-None-Match") == etag and os.path.isfile(out):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "private, max-age=604800")
+            self.end_headers()
+            return
+        if not os.path.isfile(out):
+            os.makedirs(self.cfg.preview_cache, exist_ok=True)
+            lock = self.cfg.lock_for("preview:" + digest)
+            with lock:                       # one render per file at a time
+                if not os.path.isfile(out):
+                    prune_preview_cache(self.cfg.preview_cache)
+                    try:
+                        render_preview(dest, out, want)
+                    except Exception as exc:
+                        # A corrupt/undecodable file is a preview problem, not a
+                        # server error: let the card keep its EXIF thumbnail.
+                        raise HTTPError(415, "cannot render this image: %s" % exc)
+        with open(out, "rb") as f:
+            data = f.read()
+        self._send_bytes(data, "image/jpeg", 200, {
+            "ETag": etag,
+            "X-Content-Type-Options": "nosniff",
+            "X-Preview-Edge": str(want),
+        }, cache="private, max-age=604800")  # immutable for this (size, mtime, w)
 
     # ---- API: delete -------------------------------------------------------
     def _api_delete(self) -> None:

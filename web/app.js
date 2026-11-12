@@ -33,6 +33,7 @@
   var tokenRequired = true;
   var serverChunk = 0;
   var mediaToken = '';      // header-less media use this instead of X-LT-Token
+  var serverPil = false;    // /api/image can render display copies server-side
   var busy = false;
 
   // ---- logging ------------------------------------------------------------
@@ -119,6 +120,7 @@
       serverChunk = info.chunk_size;
       mediaToken = info.media_token || '';
       tokenRequired = info.token_required !== false;
+      serverPil = info.preview_pipeline === true;
     } catch (e) {
       // 401 means the server does require a token: show the input and stop.
       if (e.status === 401) {
@@ -417,6 +419,12 @@
   }
   function thumbPath(f) {
     return '/api/thumb?name=' + qs(f.name) + versionQuery(f);
+  }
+  // A display copy the server renders at the size the screen needs (longest
+  // edge `w`). The camera thumbnail is only 160x120; this is what keeps a card
+  // sharp when it is 350-700 CSS px wide.
+  function imagePath(f, w) {
+    return '/api/image?name=' + qs(f.name) + '&w=' + w + versionQuery(f);
   }
 
   // Read the response body, bounded by Content-Length. fetch() already frames
@@ -753,12 +761,43 @@
   var PREFIX_STEPS = [262144, 1048576, 3145728];
   var THUMB_FULL_MAX = 8 << 20;
 
+  // Server-rendered display copy sized for this card at the screen's own pixel
+  // density (a 358 px card on a 2x screen asks for 720 px), so nothing is ever
+  // upscaled. null = no pipeline on this server, or this file cannot be
+  // decoded, in which case the caller keeps the EXIF-thumbnail behaviour.
+  async function fetchRendered(card, f) {
+    var fig = card.el.querySelector('.card-fig');
+    var cw = (fig && fig.clientWidth) || 320;
+    var dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+    // Quantise to 40 px steps: fewer distinct renders, better cache reuse
+    // across cards of slightly different widths.
+    var want = Math.round(cw * dpr / 40) * 40;
+    want = Math.min(1080, Math.max(320, want));
+    await takePreviewSlot();
+    try {
+      return await fetchBlob(imagePath(f, want), { 'X-LT-Token': token });
+    } catch (e) {
+      if (e && e.status === 501) serverPil = false;   // server has no Pillow
+      return null;
+    } finally {
+      releasePreviewSlot();
+    }
+  }
+
   async function loadThumb(card) {
     if (card.loading || card.thumbOk) return;
     card.loading = true;
     var f = card.file;
     var index = card.index;
     try {
+      // Sharpest path first when the server can render: one request, no
+      // upscaling. Falls through to the camera thumbnail when it cannot.
+      if (serverPil) {
+        var rendered = await fetchRendered(card, f);
+        // The render is already upright (EXIF applied server-side), so the
+        // client must not rotate it a second time.
+        if (rendered && await showOnCard(card, rendered, 1)) return;
+      }
       var small = await fetchThumbBlob(f);
       if (small && await showOnCard(card, small.blob, small.orient)) return;
 
@@ -1304,11 +1343,17 @@
       } else {
         root.classList.add('lb-loading');
       }
-      fetchPreviewBlob(f, entry.thumbIndex, function (got, total) {
-        if (seq !== lb.state.seq || !total) return;
-        sub.textContent = subText + ' · 载入 ' +
-          Math.floor(got / total * 100) + '%';
-      }).then(function (blob) {
+      // 1600 px is sharper than any screen this lands on and costs ~200 KB
+      // instead of the original's 10 MB; without a server pipeline the original
+      // is streamed exactly as before.
+      var big = serverPil
+        ? fetchBlob(imagePath(f, 1600), { 'X-LT-Token': token })
+        : fetchPreviewBlob(f, entry.thumbIndex, function (got, total) {
+            if (seq !== lb.state.seq || !total) return;
+            sub.textContent = subText + ' · 载入 ' +
+              Math.floor(got / total * 100) + '%';
+          });
+      big.then(function (blob) {
         if (seq !== lb.state.seq) return;
         root.classList.remove('lb-loading');
         sub.textContent = subText;
