@@ -70,7 +70,7 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     HAS_PIL = False
 
-WEB_VERSION = "1.3.0"
+WEB_VERSION = "1.4.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
 MAX_INIT_BODY = 64 << 20
@@ -123,8 +123,15 @@ ORIENT_TRANSPOSE = {
 }
 PREVIEW_DEFAULT_W = 720        # card size on a 2x screen
 PREVIEW_MAX_W = 2048           # never render bigger than this for a browser
+PREVIEW_WIDTH_STEP = 40        # widths snap to this grid: bounded cache keys
 PREVIEW_QUALITY = 82
 PREVIEW_CACHE_TTL = 30 * 86400  # drop rendered copies after a month
+PREVIEW_CACHE_MAX = 600        # ...and keep at most this many of them
+PREVIEW_PRUNE_EVERY = 60       # seconds between cache sweeps (not per request)
+# Rendering a 32 MP frame is CPU-bound; letting every keep-alive connection do
+# it at once would starve the single-process server on a small box.
+RENDER_SLOTS = threading.BoundedSemaphore(
+    max(1, min(4, (os.cpu_count() or 2))))
 
 
 class HTTPError(Exception):
@@ -148,6 +155,12 @@ class Config:
         self.token = token
         self._locks: Dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        # Preview renders are keyed by (name, size, mtime, width), so a lock per
+        # key would grow without bound. A fixed pool serialises the same key
+        # while costing a constant amount of memory; rare collisions merely
+        # queue two unrelated renders behind each other.
+        self._preview_locks = [threading.Lock() for _ in range(32)]
+        self._pruned_at = 0.0
 
     def ensure_dirs(self) -> None:
         os.makedirs(self.dir, exist_ok=True)
@@ -162,6 +175,22 @@ class Config:
                 lock = threading.Lock()
                 self._locks[key] = lock
             return lock
+
+    def preview_lock(self, digest: str) -> threading.Lock:
+        """One lock per cache key, drawn from a fixed pool (see __init__)."""
+        return self._preview_locks[int(digest[:8], 16) % len(self._preview_locks)]
+
+    def maybe_prune_previews(self) -> None:
+        """Sweep the render cache, at most once per PREVIEW_PRUNE_EVERY seconds.
+
+        Sweeping on every render made the directory scan part of the request
+        path; with a few hundred cached files that is visible on a tunnel.
+        """
+        now = time.time()
+        if now - self._pruned_at < PREVIEW_PRUNE_EVERY:
+            return
+        self._pruned_at = now
+        prune_preview_cache(self.preview_cache)
 
 
 def is_hex64(value: Any) -> bool:
@@ -347,20 +376,39 @@ def render_preview(src: str, out: str, want: int) -> None:
             pass
 
 
-def prune_preview_cache(directory: str) -> None:
-    """Drop rendered copies that nothing has asked for in PREVIEW_CACHE_TTL."""
+def prune_preview_cache(directory: str, max_entries: int = PREVIEW_CACHE_MAX) -> None:
+    """Bound the render cache: drop stale copies, then the oldest over the cap.
+
+    Renders are keyed by (name, size, mtime, width); a library that gets
+    re-exported or a client asking for many widths could otherwise grow this
+    folder without limit. Deleting a cache file is always safe - the next
+    request simply renders again.
+    """
     cutoff = time.time() - PREVIEW_CACHE_TTL
     try:
-        entries = os.scandir(directory)
+        entries = [e for e in os.scandir(directory) if e.is_file()]
     except OSError:
         return
-    with entries:
-        for ent in entries:
+    keep = []
+    for ent in entries:
+        try:
+            st = ent.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
             try:
-                if ent.is_file() and ent.stat().st_mtime < cutoff:
-                    os.remove(ent.path)
+                os.remove(ent.path)
             except OSError:
-                continue
+                pass
+        else:
+            keep.append((st.st_mtime, ent.path))
+    if len(keep) > max_entries:
+        keep.sort()
+        for _mtime, path in keep[:len(keep) - max_entries]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def validate_manifest(obj: Any, cfg: Config) -> Dict[str, Any]:
@@ -899,6 +947,26 @@ class Handler(BaseHTTPRequestHandler):
         if length and self.command != "HEAD":
             self._stream_file(dest, start, length)
 
+    # ---- API: image helpers ------------------------------------------------
+    def _image_target(self, q, what: str) -> Tuple[str, str, os.stat_result, int]:
+        """Validate ?name= as an image and stat the stored file.
+
+        Shared by /api/thumb and /api/image: both answer 415 for anything that
+        is not an image and 404 for a missing file, and both key their cache on
+        the same (size, mtime_ns) version pair. Keeping the guards in one place
+        is what stops the two endpoints from drifting apart.
+        """
+        name = safe_name(self._qs(q, "name"))
+        kind, _ctype = media_type(name)
+        if kind != "image":
+            raise HTTPError(415, "only images have a %s" % what)
+        dest = os.path.join(self.cfg.dir, name)
+        if not os.path.isfile(dest):
+            raise HTTPError(404, "file not found")
+        st = os.stat(dest)
+        return name, dest, st, getattr(st, "st_mtime_ns",
+                                       int(st.st_mtime * 1e9))
+
     # ---- API: thumbnail ----------------------------------------------------
     def _api_thumb(self, q) -> None:
         """GET /api/thumb?name=... -> the JPEG's own EXIF thumbnail (tiny!).
@@ -912,16 +980,8 @@ class Handler(BaseHTTPRequestHandler):
         then falls back to /api/preview (a prefix of the original, or all of
         it). That is why 415 here must NOT be read as "unpreviewable".
         """
-        name = safe_name(self._qs(q, "name"))
-        kind, _ctype = media_type(name)
-        if kind != "image":
-            raise HTTPError(415, "only images have a thumbnail")
-        dest = os.path.join(self.cfg.dir, name)
-        if not os.path.isfile(dest):
-            raise HTTPError(404, "file not found")
-        st = os.stat(dest)
-        etag = '"t%x-%x"' % (st.st_size, getattr(st, "st_mtime_ns",
-                                                 int(st.st_mtime * 1e9)))
+        name, dest, st, mtime_ns = self._image_target(q, "thumbnail")
+        etag = '"t%x-%x"' % (st.st_size, mtime_ns)
         if self.headers.get("If-None-Match") == etag:
             self.send_response(304)
             self.send_header("ETag", etag)
@@ -960,21 +1020,17 @@ class Handler(BaseHTTPRequestHandler):
         if not HAS_PIL:
             raise HTTPError(501, "this server has no image pipeline "
                                  "(Pillow is not installed)")
-        name = safe_name(self._qs(q, "name"))
         raw_w = self._qs(q, "w") or str(PREVIEW_DEFAULT_W)
         try:
             want = int(raw_w)
         except ValueError:
             raise HTTPError(400, "w must be an integer")
         want = max(64, min(want, PREVIEW_MAX_W))
-        kind, _ctype = media_type(name)
-        if kind != "image":
-            raise HTTPError(415, "only images can be rendered")
-        dest = os.path.join(self.cfg.dir, name)
-        if not os.path.isfile(dest):
-            raise HTTPError(404, "file not found")
-        st = os.stat(dest)
-        mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
+        # Snap to the same grid the browser quantises to, so 517px and 520px
+        # share one cache entry instead of rendering twice.
+        want = int(round(want / PREVIEW_WIDTH_STEP)) * PREVIEW_WIDTH_STEP
+        want = max(64, min(want, PREVIEW_MAX_W))
+        name, dest, st, mtime_ns = self._image_target(q, "preview")
         digest = hashlib.sha256(
             ("%s|%d|%d|%d" % (name, st.st_size, mtime_ns, want)).encode("utf-8")
         ).hexdigest()[:32]
@@ -988,16 +1044,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not os.path.isfile(out):
             os.makedirs(self.cfg.preview_cache, exist_ok=True)
-            lock = self.cfg.lock_for("preview:" + digest)
-            with lock:                       # one render per file at a time
+            with self.cfg.preview_lock(digest):   # one render per key at a time
                 if not os.path.isfile(out):
-                    prune_preview_cache(self.cfg.preview_cache)
-                    try:
-                        render_preview(dest, out, want)
-                    except Exception as exc:
-                        # A corrupt/undecodable file is a preview problem, not a
-                        # server error: let the card keep its EXIF thumbnail.
-                        raise HTTPError(415, "cannot render this image: %s" % exc)
+                    self.cfg.maybe_prune_previews()
+                    with RENDER_SLOTS:            # bound concurrent CPU work
+                        try:
+                            render_preview(dest, out, want)
+                        except Exception as exc:
+                            # A corrupt/undecodable file is a preview problem,
+                            # not a server error: let the card keep its EXIF
+                            # thumbnail instead of failing the whole wall.
+                            raise HTTPError(
+                                415, "cannot render this image: %s" % exc)
         with open(out, "rb") as f:
             data = f.read()
         self._send_bytes(data, "image/jpeg", 200, {
@@ -1157,12 +1215,20 @@ def main(argv: Optional[list] = None) -> int:
     scheme = "https" if tls else "http"
     shown_host = "127.0.0.1" if args.host in ("0.0.0.0", "", "::") else args.host
     print("=" * 70)
-    print("  lossless-transfer  WEB  v%s   (Python stdlib only)" % WEB_VERSION)
+    print("  lossless-transfer  WEB  v%s   (%s)" % (
+        WEB_VERSION,
+        "Python stdlib + Pillow previews" if HAS_PIL else "Python stdlib only"))
     print("=" * 70)
     print("  Library dir  : %s" % cfg.dir)
     print("  Chunk size   : %d bytes (%.1f MiB)" %
           (cfg.chunk_size, cfg.chunk_size / 1048576.0))
     print("  Local URL    : %s://%s:%d" % (scheme, shown_host, args.port))
+    if HAS_PIL:
+        print("  Previews     : rendered on demand (sharp cards); cached in %s"
+              % cfg.preview_cache)
+    else:
+        print("  Previews     : EXIF thumbnail only - install Pillow for sharp "
+              "cards (pip install pillow)")
     if token:
         print("  ACCESS TOKEN : %s" % token)
         print("  -> enter this token in the web page (sent as X-LT-Token header)")

@@ -75,9 +75,24 @@
     return (n / 1073741824).toFixed(2) + ' GiB';
   }
 
+  // One formatter for the whole page: toLocaleString() allocates a fresh
+  // Intl.DateTimeFormat per call, which adds up over a few hundred cards. The
+  // numeric layout is also what fits a card footer without wrapping.
+  var dateFmt = null;
+  try {
+    if (typeof Intl === 'object' && Intl.DateTimeFormat) {
+      dateFmt = new Intl.DateTimeFormat('zh-CN', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: false
+      });
+    }
+  } catch (e) { dateFmt = null; }
+
   function fmtDate(ns) {
+    var d = new Date(Number(ns) / 1e6);
+    if (isNaN(d.getTime())) return '';
     try {
-      return new Date(Number(ns) / 1e6).toLocaleString('zh-CN');
+      return dateFmt ? dateFmt.format(d) : d.toLocaleString('zh-CN');
     } catch (e) { return ''; }
   }
 
@@ -615,7 +630,7 @@
 
   function loadVideoStill(card) {
     if (card.loading || card.unpreviewable) return;
-    var v = card.el.querySelector('.card-poster');
+    var v = card.poster || card.el.querySelector('.card-poster');
     if (!v) return;
     var url = previewPath(card.file, card.index) + tokenQuery();
     var settled = false;
@@ -633,8 +648,8 @@
         // A clip is usually 16:9, not the 3:4 stand-in the column maths used;
         // adopt the real size now that metadata has arrived.
         if (v.videoWidth && v.videoHeight) {
-          var fig = card.el.querySelector('.card-fig');
-          if (fig) fig.style.aspectRatio = (v.videoWidth / v.videoHeight);
+          var vfig = card.fig || card.el.querySelector('.card-fig');
+          if (vfig) vfig.style.aspectRatio = (v.videoWidth / v.videoHeight);
         }
       } else {
         v.removeAttribute('src');
@@ -709,7 +724,7 @@
   // ratio must be swapped so the CSS rotation lands exactly in the box.
   function applyCardAspect(card, w, h) {
     if (!w || !h) return;
-    var fig = card.el.querySelector('.card-fig');
+    var fig = card.fig || card.el.querySelector('.card-fig');
     if (!fig) return;
     var ratio = (card.orient >= 5) ? (h / w) : (w / h);
     // A corrupt thumbnail tag can claim an absurd size; clamping keeps one card
@@ -726,7 +741,7 @@
   // `orient` is the EXIF orientation to apply - only the embedded thumbnail
   // needs it; a full file carries its own tag and the browser turns it.
   function showOnCard(card, blob, orient) {
-    var img = card.el.querySelector('.card-thumb');
+    var img = card.img || card.el.querySelector('.card-thumb');
     if (!img) return Promise.resolve(false);
     return new Promise(function (resolve) {
       var url = URL.createObjectURL(blob);
@@ -767,7 +782,7 @@
   // upscaled. null = no pipeline on this server, or this file cannot be
   // decoded, in which case the caller keeps the EXIF-thumbnail behaviour.
   async function fetchRendered(card, f) {
-    var fig = card.el.querySelector('.card-fig');
+    var fig = card.fig || card.el.querySelector('.card-fig');
     var cw = (fig && fig.clientWidth) || 320;
     var dpr = Math.min(window.devicePixelRatio || 1, 2.5);
     // Quantise to 40 px steps: fewer distinct renders, better cache reuse
@@ -837,6 +852,10 @@
 
     var fig = document.createElement('div');
     fig.className = 'card-fig';
+    // Kept on the card record: the thumbnail/poster code touches these on every
+    // load, and re-querying the subtree each time is needless work.
+    var imgEl = null;
+    var posterEl = null;
 
     if (f.kind === 'image') {
       var img = document.createElement('img');
@@ -844,6 +863,7 @@
       img.alt = f.name;
       img.decoding = 'async';
       img.draggable = false;
+      imgEl = img;
       fig.appendChild(img);
       // Placeholder under the picture: it pulses while the thumbnail is on its
       // way and carries the reason if the image can never be shown.
@@ -868,6 +888,7 @@
       poster.setAttribute('tabindex', '-1');
       poster.setAttribute('aria-hidden', 'true');
       poster.preload = 'metadata';
+      posterEl = poster;
       fig.appendChild(poster);
       var badge = document.createElement('span');
       badge.className = 'card-badge';
@@ -929,8 +950,8 @@
     el.appendChild(acts);
 
     return {
-      file: f, index: index, el: el, thumbUrl: null, thumbOk: false,
-      loading: false
+      file: f, index: index, el: el, fig: fig, img: imgEl, poster: posterEl,
+      thumbUrl: null, thumbOk: false, loading: false
     };
   }
 
@@ -991,8 +1012,10 @@
   // Rough height of a card at this column width. It only decides WHICH column a
   // card goes into; the exact height arrives with the thumbnail and the card
   // simply grows in place, which is what a waterfall is supposed to do.
-  function estimateHeight(f, col) {
-    var cw = (col && col.clientWidth) || 260;
+  // `colWidth` is passed in (not read per card) so laying out 100 files does
+  // not force 100 layout flushes just to measure an unchanged width.
+  function estimateHeight(f, colWidth) {
+    var cw = colWidth || 260;
     var ratio = (f.kind === 'video') ? (16 / 9) : (3 / 4);
     return cw / ratio + 96;
   }
@@ -1020,6 +1043,8 @@
     list.classList.remove('empty');
     var cols = buildColumns(list);
     var heights = cols.map(function () { return 0; });
+    // one measurement for the whole wall: every column is equally wide
+    var colWidth = (cols[0] && cols[0].clientWidth) || 260;
     var thumbIndex = 0;
     var order = 0;
     files.forEach(function (f) {
@@ -1034,7 +1059,7 @@
       card.el.style.setProperty('--d', Math.min(order, 18) * 30 + 'ms');
       var target = shortest(heights);
       cols[target].appendChild(card.el);
-      heights[target] += estimateHeight(f, cols[target]);
+      heights[target] += estimateHeight(f, colWidth);
       order += 1;
       if (f.kind === 'image') {
         if (io) io.observe(card.el);
@@ -1055,14 +1080,23 @@
     if (want === lastColCount) return;
     var list = $('fileList');
     if (!list) return;
+    // Measure BEFORE the columns are rebuilt: buildColumns() empties the list,
+    // and a detached element reports offsetHeight 0, which used to make every
+    // re-deal fall back to the 3:4 estimate.
+    var measured = {};
+    files.forEach(function (f) {
+      var c = cards[f.name];
+      measured[f.name] = c ? c.el.offsetHeight : 0;
+    });
     var cols = buildColumns(list);
     var heights = cols.map(function () { return 0; });
+    var colWidth = (cols[0] && cols[0].clientWidth) || 260;
     files.forEach(function (f) {
       var card = cards[f.name];
       if (!card) return;
       var target = shortest(heights);
       cols[target].appendChild(card.el);
-      heights[target] += (card.el.offsetHeight || estimateHeight(f, cols[target]));
+      heights[target] += (measured[f.name] || estimateHeight(f, colWidth));
     });
   }
 
@@ -1464,11 +1498,9 @@
       files.forEach(function (f) { toggleSelect(f.name, false); });
     };
     $('selDownloadBtn').onclick = downloadSelected;
-    window.addEventListener('scroll', function () {
-      // nothing to pin any more: kept so the selection bar stays in sync
-      // after a programmatic scroll
-      updateSelBar();
-    }, { passive: true });
+    // No scroll handler: the bar is position:fixed and the selection only
+    // changes on user input, so recomputing on every scroll event was pure
+    // O(files) work per frame while flicking through a large wall.
     var relayoutPending = false;
     window.addEventListener('resize', function () {
       if (relayoutPending) return;

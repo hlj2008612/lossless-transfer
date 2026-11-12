@@ -20,9 +20,7 @@
   --ok:#1a7f52;
   --warn:#9a6700;
   --danger:#c0353a;
-  --danger-soft:#fdecec;
   --shadow:0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.06);
-  --shadow-lg:0 24px 64px rgba(16,24,40,.18);
   --radius:14px;
   --radius-sm:10px;
   --mono:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;
@@ -44,9 +42,7 @@
     --ok:#4ade9b;
     --warn:#e3b341;
     --danger:#ff7b7b;
-    --danger-soft:#2a1a1c;
     --shadow:0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
-    --shadow-lg:0 24px 64px rgba(0,0,0,.55);
     color-scheme:dark;
   }
 }
@@ -57,9 +53,8 @@ html[data-theme="light"]{
   --line:#e5e7ec; --line-strong:#d3d7df;
   --fg:#1b1f27; --fg-2:#4a5160; --muted:#7a8291;
   --accent:#1f6feb; --accent-ink:#ffffff; --accent-soft:#e8f0fe;
-  --ok:#1a7f52; --warn:#9a6700; --danger:#c0353a; --danger-soft:#fdecec;
+  --ok:#1a7f52; --warn:#9a6700; --danger:#c0353a;
   --shadow:0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.06);
-  --shadow-lg:0 24px 64px rgba(16,24,40,.18);
   color-scheme:light;
 }
 
@@ -128,8 +123,6 @@ input[type=password]:focus, input[type=text]:focus{
 .btn.primary:hover{filter:brightness(1.06); background:var(--accent)}
 .btn.ghost{background:transparent}
 .btn.ghost:hover{background:var(--surface-2)}
-.btn.danger{color:var(--danger); border-color:var(--line-strong)}
-.btn.danger:hover{background:var(--danger-soft); border-color:var(--danger)}
 .btn.small{padding:6px 11px; font-size:12.5px}
 .btn:disabled{opacity:.45; cursor:default; filter:none}
 .btn:disabled:hover{border-color:var(--line-strong); background:var(--surface)}
@@ -211,21 +204,12 @@ input[type=password]:focus, input[type=text]:focus{
 .list-empty{color:var(--muted); font-size:13px; padding:22px 0; text-align:center}
 
 /* ---- selection bar ------------------------------------------------------ */
-/* Sits at the end of the library card (where the selection is made); once
-   that card scrolls out of view app.js adds .sel-pinned and the bar floats
-   over the viewport bottom so batch actions stay in reach on long grids. */
+/* Base look only: the wall page pins this bar to the viewport bottom itself
+   (see gallery.css), so there is no pin/unpin state to keep in sync. */
 .selbar{
   margin-top:14px; padding:10px 12px 10px 14px; border-radius:var(--radius-sm);
   background:var(--surface-2); border:1px solid var(--line);
   display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;
-}
-.selbar.sel-pinned{
-  position:fixed; left:50%; transform:translateX(-50%);
-  bottom:calc(16px + env(safe-area-inset-bottom));
-  z-index:50; width:min(600px, calc(100vw - 28px)); margin:0;
-  background:var(--surface); border-color:var(--line-strong);
-  box-shadow:var(--shadow-lg);
-  animation:sel-in .16s ease-out;
 }
 @keyframes sel-in{from{opacity:0; transform:translate(-50%, 8px)} to{opacity:1; transform:translate(-50%, 0)}}
 body.has-selbar{padding-bottom:96px}
