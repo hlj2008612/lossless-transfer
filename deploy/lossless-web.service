@@ -24,6 +24,19 @@ Environment=PYTHON_EXE=/usr/bin/python3
 ExecStart=/home/mq/lossless-transfer/scripts/start_web.sh --behind-tls --open --dir shared --host 127.0.0.1 --port 8765
 Restart=on-failure
 RestartSec=3
+
+# Sandboxing. The service only needs to write inside the project directory, so
+# everything else can be read-only: /etc, /usr and /boot are protected, /tmp is
+# private, and no new privileges can be gained. MemoryMax keeps a pathological
+# image (or an oversized upload) from taking the whole VM down with it.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+MemoryMax=2G
 # A transfer is a long-lived socket; do not let a slow LAN packet kill it.
 TimeoutStopSec=20
 

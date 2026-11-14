@@ -523,6 +523,92 @@ class WebTransferE2E(unittest.TestCase):
             os.remove(noexif_path)
 
 
+    # ---- Range handling: the whole of <video> seeking lives here ----------
+    def _put(self, name: str, data: bytes) -> None:
+        with open(os.path.join(self.lib, name), "wb") as f:
+            f.write(data)
+
+    def test_18_range_first_bytes(self):
+        data = sample_bytes(1000, seed=11)
+        self._put("range.jpg", data)
+        st, h, body = self.req("GET", "/api/preview?name=range.jpg",
+                               headers={"Range": "bytes=0-99"})
+        self.assertEqual(st, 206)
+        self.assertEqual(body, data[:100])
+        self.assertEqual(h["content-range"], "bytes 0-99/1000")
+        self.assertEqual(h["accept-ranges"], "bytes")
+        self.assertEqual(h["content-length"], "100")
+
+    def test_18b_range_suffix(self):
+        data = sample_bytes(1000, seed=12)
+        self._put("range2.jpg", data)
+        st, h, body = self.req("GET", "/api/preview?name=range2.jpg",
+                               headers={"Range": "bytes=-100"})
+        self.assertEqual(st, 206)
+        self.assertEqual(body, data[-100:])
+        self.assertEqual(h["content-range"], "bytes 900-999/1000")
+
+    def test_18c_range_open_ended(self):
+        data = sample_bytes(1000, seed=13)
+        self._put("range3.jpg", data)
+        st, h, body = self.req("GET", "/api/preview?name=range3.jpg",
+                               headers={"Range": "bytes=900-"})
+        self.assertEqual(st, 206)
+        self.assertEqual(body, data[900:])
+        self.assertEqual(h["content-range"], "bytes 900-999/1000")
+
+    def test_18d_range_beyond_eof_is_416(self):
+        data = sample_bytes(1000, seed=14)
+        self._put("range4.jpg", data)
+        st, h, _ = self.req("GET", "/api/preview?name=range4.jpg",
+                            headers={"Range": "bytes=5000-"})
+        self.assertEqual(st, 416)
+        self.assertEqual(h["content-range"], "bytes */1000")
+
+    def test_18e_malformed_range_is_ignored(self):
+        # RFC 9110: a Range a server cannot parse must be ignored, not rejected;
+        # answering 416 there would make some players give up instead of
+        # falling back to a plain GET.
+        data = sample_bytes(300, seed=15)
+        self._put("range5.jpg", data)
+        st, h, body = self.req("GET", "/api/preview?name=range5.jpg",
+                               headers={"Range": "bytes=abc"})
+        self.assertEqual(st, 200)
+        self.assertEqual(body, data)
+        self.assertNotIn("content-range", h)
+
+    def test_18f_unknown_range_unit_is_ignored(self):
+        data = sample_bytes(200, seed=16)
+        self._put("range6.jpg", data)
+        st, _, body = self.req("GET", "/api/preview?name=range6.jpg",
+                               headers={"Range": "items=0-10"})
+        self.assertEqual(st, 200)
+        self.assertEqual(body, data)
+
+    # ---- file-name rules that only bite on Windows peers ------------------
+    def _init_status(self, name: str) -> int:
+        st, _, _ = self.req_json("POST", "/api/upload/init",
+                                 browser_manifest(name, b"x"))
+        return st
+
+    def test_19_reserved_device_names_rejected(self):
+        for bad in ("CON.MOV", "nul.jpg", "aux", "COM1.txt", "LPT9.MOV"):
+            self.assertEqual(self._init_status(bad), 400, bad)
+
+    def test_19b_trailing_dot_or_space_rejected(self):
+        for bad in ("vacation.jpg.", "vacation.jpg "):
+            self.assertEqual(self._init_status(bad), 400, bad)
+
+    def test_19c_control_character_rejected(self):
+        self.assertEqual(self._init_status("bad\tname.jpg"), 400)
+
+    def test_19d_ordinary_names_still_accepted(self):
+        # "console" merely *starts* like CON; only the stem before the first
+        # dot is compared, so this must pass.
+        for good in ("console.log.jpg", "period.2026.jpg", "中文 照片.JPG"):
+            self.assertEqual(self._init_status(good), 200, good)
+
+
 class ThumbExtraction(unittest.TestCase):
     """Pure-Python EXIF thumbnail extraction: byte order, bounds, junk input."""
 
@@ -757,3 +843,62 @@ class WebTransferOpenMode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class DiskReserve(unittest.TestCase):
+    """An upload must not be able to eat the last free bytes of the disk."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = tempfile.mkdtemp(prefix="lt-web-disk-")
+        cls.lib = os.path.join(cls.tmp, "shared")
+        # A reserve larger than any real disk makes the check fire every time,
+        # which is what we want to observe here.
+        cls.cfg = wt.Config("127.0.0.1", 0, cls.lib, CHUNK_SIZE, "",
+                            min_free_bytes=1 << 60)
+        cls.cfg.ensure_dirs()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), wt.Handler)
+        cls.httpd.daemon_threads = True
+        cls.httpd.cfg = cls.cfg
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.thread.join(timeout=5)
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_20_upload_refused_when_free_space_below_reserve(self):
+        data = sample_bytes(200, seed=21)
+        m = browser_manifest("big.jpg", data)
+        body = json.dumps(m, separators=(",", ":")).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("POST", "/api/upload/init", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        payload = resp.read()
+        status = resp.status
+        conn.close()
+        self.assertEqual(status, 507, payload[:300])
+        self.assertIn(b"disk space", payload)
+
+    def test_20b_reserve_of_zero_disables_the_check(self):
+        self.cfg.min_free_bytes = 0
+        try:
+            data = sample_bytes(200, seed=22)
+            m = browser_manifest("ok.jpg", data)
+            body = json.dumps(m, separators=(",", ":")).encode()
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+            conn.request("POST", "/api/upload/init", body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            payload = resp.read()
+            status = resp.status
+            conn.close()
+            self.assertEqual(status, 200, payload[:300])
+        finally:
+            self.cfg.min_free_bytes = 1 << 60

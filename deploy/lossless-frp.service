@@ -5,6 +5,11 @@ Documentation=https://doc.natfrp.com/
 # connection needs a working route (not just a link).
 After=network-online.target lossless-web.service
 Wants=network-online.target
+# A wrong or deleted tunnel id makes frpc exit immediately; without a start
+# limit systemd would retry every 5 s forever and bury the real cause in the
+# journal.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple

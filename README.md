@@ -350,8 +350,14 @@ pwsh -NoProfile -File .\scripts\start_web.ps1 -Token 你自己的口令
 | GET | `/api/image?name=&w=` | **按需渲染的展示副本**（需要 Pillow）：把原图缩到最长边 `w`（默认 720，上限 2048）的 JPEG q82，首次请求生成并缓存到 `.lossless-web/previews/`，之后纯磁盘读；`ETag` 由 `(name, size, mtime, w)` 派生，条件请求走 `304`；照片墙卡片按屏幕像素密度取 320–1080，灯箱取 1600。非图片 → `415`，**没装 Pillow → `501`**（前端自动退回 `/api/thumb` + `/api/preview`） |
 | POST | `/api/upload/init` | 提交清单；返回 `status=upload` + `next_index`（或 `complete` 幂等跳过） |
 | POST | `/api/upload/chunk?name=&index=` | 上传一块原始字节，服务端逐块校验 SHA-256 |
+| POST | `/api/upload/complete` | 整文件复算通过后**原子发布**；磁盘余量低于 `--min-free-bytes` 时 `init` 直接返回 507 |
 | POST | `/api/upload/complete` | 整文件复算 → 原子发布 → 恢复元数据 |
 | GET | `/api/download/manifest?name=` | 取该文件的逐块清单 |
+
+上传侧的两条硬性约束：
+
+- **磁盘余量**：`/api/upload/init` 会先看目标盘剩余空间，要求「剩余 − 本次大小 ≥ 512 MiB」（阈值可调：`--min-free-bytes`，`0` 关闭）。否则返回 `507`，避免一次上传把根分区写满、连 sshd 一起拖死。
+- **文件名**：拒绝 Windows 保留设备名（`CON`/`NUL`/`COM1`…）、尾随点或空格、以及控制字符——这些名字在 Linux 上能建、在 Windows 上建不出来或指向设备，跨平台传输会造成「传过去却存不上」。
 | GET | `/api/download/chunk?name=&index=` | 取一块，附 `X-Chunk-Index` / `X-Chunk-Sha256` 头 |
 | POST | `/api/delete` | 删除文件及其暂存状态 |
 

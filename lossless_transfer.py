@@ -215,8 +215,15 @@ def read_json(path: str) -> Optional[Dict[str, Any]]:
         return json.load(f)
 
 
-def save_resume_state(out_path: str, manifest: Dict[str, Any], next_index: int) -> None:
-    write_json_atomic(resume_state_path(out_path), {
+def save_resume_state(out_path: str, manifest: Dict[str, Any], next_index: int,
+                      next_offset: Optional[int] = None) -> None:
+    """Persist the resume point.
+
+    `next_offset` is the byte position the next chunk appends at. Callers that
+    track it incrementally pass it in, which keeps the web upload path O(1) per
+    chunk instead of re-summing every preceding chunk length.
+    """
+    record = {
         "version": STATE_VERSION,
         "name": manifest["name"],
         "size": manifest["size"],
@@ -225,7 +232,10 @@ def save_resume_state(out_path: str, manifest: Dict[str, Any], next_index: int) 
         "chunks": manifest["chunks"],
         "next_index": next_index,
         "updated_at": time.time(),
-    })
+    }
+    if next_offset is not None:
+        record["next_offset"] = next_offset
+    write_json_atomic(resume_state_path(out_path), record)
 
 
 def load_resume_state(out_path: str, manifest: Dict[str, Any]) -> int:

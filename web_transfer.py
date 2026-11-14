@@ -43,6 +43,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import struct
 import ssl
 import sys
@@ -70,9 +71,18 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     HAS_PIL = False
 
-WEB_VERSION = "1.4.0"
+WEB_VERSION = "1.5.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
+# Never let an upload eat the last slice of the disk: a full root filesystem
+# takes journald and sshd down with it, which turns "someone uploaded too much"
+# into "the box is unreachable". 512 MiB is the floor, overridable with
+# --min-free-bytes (0 disables the check).
+MIN_FREE_BYTES = 512 * 1024 * 1024
+
+# Sentinel for _parse_range: a syntactically valid range that this file cannot
+# satisfy (416), as opposed to a header that should simply be ignored (200).
+_RANGE_UNSATISFIABLE = object()
 MAX_INIT_BODY = 64 << 20
 MAX_SMALL_BODY = 1 << 20
 PREVIEW_CHUNK = 1 << 20             # rolling read size for streamed responses
@@ -143,7 +153,8 @@ class HTTPError(Exception):
 
 class Config:
     def __init__(self, host: str, port: int, directory: str,
-                 chunk_size: int, token: str) -> None:
+                 chunk_size: int, token: str,
+                 min_free_bytes: int = MIN_FREE_BYTES) -> None:
         self.host = host
         self.port = port
         self.dir = os.path.abspath(directory)
@@ -153,6 +164,8 @@ class Config:
         self.preview_cache = os.path.join(self.staging, "previews")
         self.chunk_size = chunk_size
         self.token = token
+        # Floor of free space an upload may not eat into (0 = no check).
+        self.min_free_bytes = min_free_bytes
         self._locks: Dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
         # Preview renders are keyed by (name, size, mtime, width), so a lock per
@@ -198,6 +211,16 @@ def is_hex64(value: Any) -> bool:
             and all(c in "0123456789abcdef" for c in value))
 
 
+# Windows reserves these stems for devices; opening "CON" writes to the console
+# and "NUL" discards the bytes. The server also runs on Windows, and a name
+# accepted here is one a Windows peer will be asked to save.
+WIN_RESERVED_STEMS = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
 def safe_name(name: Any) -> str:
     """Reject path traversal, hidden/reserved names and internal suffixes."""
     if not isinstance(name, str) or not name:
@@ -208,9 +231,28 @@ def safe_name(name: Any) -> str:
         raise HTTPError(400, "file name too long")
     if name in (".", "..") or name.startswith("."):
         raise HTTPError(400, "invalid file name (hidden/reserved)")
+    if any(ord(ch) < 32 for ch in name):
+        raise HTTPError(400, "invalid file name (control character)")
+    # "a.jpg." and "a.jpg " are unusable on Windows (the OS silently strips the
+    # trailing characters, so the name that lands is not the name that was
+    # verified), and the count could never match on a round trip.
+    if name != name.rstrip(" ."):
+        raise HTTPError(400, "invalid file name (trailing dot or space)")
+    # Only the stem before the first dot matters: "con.txt" is the CON device.
+    if name.split(".")[0].upper() in WIN_RESERVED_STEMS:
+        raise HTTPError(400, "invalid file name (reserved device name)")
     if any(name.endswith(s) for s in INTERNAL_SUFFIXES):
         raise HTTPError(400, "invalid file name (reserved internal suffix)")
     return name
+
+
+def free_bytes(path: str) -> int:
+    """Bytes available to this user on the filesystem holding `path`."""
+    try:
+        st = os.statvfs(path)          # POSIX
+        return st.f_bavail * st.f_frsize
+    except AttributeError:             # Windows has no statvfs
+        return shutil.disk_usage(path).free
 
 
 def media_type(name: str) -> Tuple[str, Optional[str]]:
@@ -497,7 +539,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, obj: Any, status: int = 200) -> None:
         payload = json.dumps(obj, ensure_ascii=False,
                              separators=(",", ":")).encode("utf-8")
-        self._send_bytes(payload, "application/json; charset=utf-8", status)
+        self._send_bytes(payload, "application/json; charset=utf-8", status,
+                         {"X-Content-Type-Options": "nosniff"})
 
     def _read_body(self, max_bytes: int) -> bytes:
         try:
@@ -557,12 +600,18 @@ class Handler(BaseHTTPRequestHandler):
         return os.path.join(self.cfg.staging, key), key
 
     # ---- range / streaming helpers -----------------------------------------
-    def _parse_range(self, size: int) -> Optional[Tuple[Optional[int],
-                                                        Optional[int]]]:
+    def _parse_range(self, size: int):
         """Parse the single byte-range of a `Range: bytes=...` header.
 
-        Returns (start, end) with BOTH inclusive (None, None) means "whole
-        file", or None when the header is unsatisfiable (RFC 9110 416).
+        Returns (start, end) — both inclusive, (None, None) meaning "send the
+        whole file" — or _RANGE_UNSATISFIABLE when the header is a well-formed
+        byte-range that no byte of this file satisfies (RFC 9110 416).
+
+        A header that is missing, uses another unit, or is syntactically
+        garbage is *ignored* rather than rejected: RFC 9110 tells servers to
+        ignore a Range they do not understand, and a 200 with the full body is
+        what every browser and CDN expects there.
+
         Multi-range requests are deliberately not multiplexed: the first
         satisfiable range is served, which is legal (a server may ignore the
         others) and keeps `<video>` seeking trivially correct.
@@ -570,28 +619,37 @@ class Handler(BaseHTTPRequestHandler):
         raw = (self.headers.get("Range") or "").strip()
         if not raw.lower().startswith("bytes="):
             return (None, None)
+        parsed_any = False
         for part in raw[6:].split(","):
             part = part.strip()
             if "-" not in part:
                 continue
             first, last = part.split("-", 1)
             first, last = first.strip(), last.strip()
-            try:
-                if not first:                       # suffix: bytes=-N
+            if not first:                       # suffix: bytes=-N
+                try:
                     n = int(last)
-                    if n <= 0 or size <= 0:
-                        continue
-                    return max(0, size - n), size - 1
-                start = int(first)                  # bytes=A- / bytes=A-B
-                if start < 0 or start >= size:
+                except ValueError:
                     continue
-                end = int(last) if last else size - 1
-                if end < start:
+                parsed_any = True
+                if n <= 0 or size <= 0:
                     continue
-                return start, min(end, size - 1)
+                return max(0, size - n), size - 1
+            try:
+                start = int(first)              # bytes=A- / bytes=A-B
             except ValueError:
                 continue
-        return None
+            parsed_any = True
+            if start < 0 or start >= size:
+                continue
+            try:
+                end = int(last) if last else size - 1
+            except ValueError:
+                continue
+            if end < start:
+                continue
+            return start, min(end, size - 1)
+        return _RANGE_UNSATISFIABLE if parsed_any else (None, None)
 
     def _stream_file(self, path: str, start: int, length: int) -> None:
         """Copy exactly `length` raw bytes from `path[start:]` to the socket.
@@ -754,6 +812,20 @@ class Handler(BaseHTTPRequestHandler):
                 raise HTTPError(
                     409, "a different file with this name already exists "
                          "(delete it first to replace)")
+            # Space check after the "identical file already here" shortcut:
+            # a re-send of an already-stored file must not fail on disk space.
+            if self.cfg.min_free_bytes > 0:
+                need = v["size"]
+                part0 = lt.part_path(staging)
+                if os.path.isfile(part0):
+                    need = max(0, need - os.path.getsize(part0))
+                avail = free_bytes(self.cfg.dir)
+                if need and avail - need < self.cfg.min_free_bytes:
+                    raise HTTPError(
+                        507, "not enough disk space: %d MiB free, this upload "
+                             "needs %d MiB and %d MiB must stay free"
+                             % (avail >> 20, need >> 20,
+                                self.cfg.min_free_bytes >> 20))
             next_index = lt.load_resume_state(staging, v)
             if next_index == 0:
                 lt.cleanup_transfer_artifacts(staging)
@@ -792,12 +864,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise HTTPError(422, "chunk %d SHA-256 mismatch (wire corruption)"
                                 % index)
             part = lt.part_path(staging)
-            expected = sum(x["length"] for x in chunks[:index])
+            # next_offset is kept in the state so this stays O(1); states
+            # written by older versions are summed once for compatibility.
+            expected = state.get("next_offset")
+            if expected is None:
+                expected = sum(x["length"] for x in chunks[:index])
             if not os.path.isfile(part) or os.path.getsize(part) != expected:
                 raise HTTPError(409, "partial file size mismatch; re-init required")
             with open(part, "ab") as f:
                 f.write(data)  # the ONLY write of file bytes; a raw byte copy
-            lt.save_resume_state(staging, state, index + 1)
+            lt.save_resume_state(staging, state, index + 1,
+                                 next_offset=expected + len(data))
         self._send_json({"ok": True, "index": index, "next_index": index + 1})
 
     def _api_upload_complete(self) -> None:
@@ -919,7 +996,7 @@ class Handler(BaseHTTPRequestHandler):
         # browser cache can never serve stale bytes.
         etag = '"%x-%x"' % (size, mtime_ns)
         rng = self._parse_range(size)
-        if rng is None:
+        if rng is _RANGE_UNSATISFIABLE:
             self._send_bytes(
                 b'{"error":"requested range not satisfiable"}',
                 "application/json; charset=utf-8", 416,
@@ -1147,6 +1224,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "scripts/start_web.sh and scripts/start_web.ps1)")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
+    p.add_argument("--min-free-bytes", type=int, default=MIN_FREE_BYTES,
+                   help="refuse an upload that would leave less free space than "
+                        "this on the library filesystem (default %d, 0 disables)"
+                        % MIN_FREE_BYTES)
     p.add_argument("--token", default=None,
                    help="access token (default $LT_TOKEN, or a random one)")
     p.add_argument("--no-auth", action="store_true",
@@ -1193,7 +1274,8 @@ def main(argv: Optional[list] = None) -> int:
         token = ""
     else:
         token = args.token or _env("LT_TOKEN", "") or secrets.token_urlsafe(18)
-    cfg = Config(args.host, args.port, args.dir, args.chunk_size, token)
+    cfg = Config(args.host, args.port, args.dir, args.chunk_size, token,
+                 min_free_bytes=max(0, args.min_free_bytes))
     cfg.ensure_dirs()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
