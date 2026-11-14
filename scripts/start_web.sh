@@ -45,7 +45,7 @@ start_web.sh - launch the lossless-transfer web server
                       0.0.0.0   = reachable from the LAN (open the firewall)
   --dir PATH          library folder                    (default: shared)
   --token SECRET      fixed access token                (default: random)
-  --open              no token at all (anyone can upload/download/DELETE)
+  --open, --no-auth   no token at all (anyone can upload/download/DELETE)
   --behind-tls        a proxy terminates TLS; serve plain HTTP here
   --regenerate-cert   regenerate tls/cert.pem + tls/key.pem
   --dns LIST          SAN list for a new certificate
@@ -72,7 +72,10 @@ while [ $# -gt 0 ]; do
         --days)       DAYS="$2" ;;
       esac
       shift 2 ;;
-    --open)            OPEN=1; shift ;;
+    # --open and --no-auth are the same thing; the Python side calls it
+    # --no-auth, this launcher has always called it --open. Accepting both
+    # means a unit file copied from the server's own flags still starts.
+    --open|--no-auth)  OPEN=1; shift ;;
     --behind-tls)      BEHIND_TLS=1; shift ;;
     --regenerate-cert) REGEN=1; shift ;;
     -h|--help)         usage; exit 0 ;;

@@ -71,17 +71,25 @@ sudo ufw delete allow 8765/tcp
 
 ## 5. 安全注意事项
 
-1. **令牌是必须的**：公网 URL 一旦存在就会被扫描。没有 `X-LT-Token` 时任何人对 `/api/delete` 都能删文件。当前令牌在 `/etc/lossless-web.env`（0600 root），**不要提交进 git、不要贴群里**。轮换：
+> **本部署当前是开放模式（`--open`，无令牌）**：拿到 URL 的任何人都能上传、下载，甚至删除文件。
+> 这是明确的取舍，不是遗漏。若哪天需要收口，见本节末尾。
+
+1. **唯一的门是那条隧道**：服务只监听 `127.0.0.1`，`ufw` 也没有放行 8765，所以外部只能通过隧道进来。不要把 `--host 0.0.0.0` 加回来——那会把同样的删改能力交给整个局域网。
+2. **URL 会被人扫到**：公网入口迟早出现在扫描日志里。想降低影响，三选一：
+   - 面板给隧道设「访问密码」（HTTP 隧道支持，浏览器先弹一次 Basic Auth）；
+   - 用完就 `sudo systemctl stop lossless-frp`，入口立即消失，本机服务不受影响；
+   - 换回令牌模式（见第 4 条）。
+3. **TLS 由节点终止**：节点用自己的自签证书（`CN=SakuraFrp Automatic TLS`，SAN 仅 `dx.frp-ski.com`），所以公网段是加密的，但**证书不代表身份**——浏览器那一次告警是正常的，别在公共网络上凭地址判断真伪。
+4. **随时可以恢复令牌**（改一行 unit 即可，不动代码）：
    ```bash
-   sudo sh -c 'umask 077; printf "LT_TOKEN=%s\n" "$(python3 -c "import secrets;print(secrets.token_urlsafe(18))")" > /etc/lossless-web.env'
-   sudo systemctl restart lossless-web
+   sudo sed -i 's|--open|--token 你的口令|' /etc/systemd/system/lossless-web.service
+   sudo systemctl daemon-reload && sudo systemctl restart lossless-web
    ```
-2. **只监听 127.0.0.1**：`0.0.0.0` 等于把同样的删改能力交给整个局域网。
-3. **必须开自动 HTTPS**（HTTP 隧道）或**本机原生 HTTPS**（TCP 隧道）：明文过公网时，令牌和文件内容都可被读取。
-4. **访问密钥（`config.json` 里的 `token`）等于账号权限**：能建/删隧道。它已被 launcher 写成 0600，别复制到别处。
-5. 免费节点**限速且共享**，不要用它传几十 GB；长期用建议付费节点或自建。
-6. 隧道被删/节点迁移时入口会失效——`Restart=always` 只能重连，不能复活已删的隧道，所以面板里别手滑删隧道。
-7. 若只想临时分享：传完就 `sudo systemctl stop lossless-frp`，公网入口立即消失，本机服务不受影响。
+   不想让口令出现在 unit 里，就把 `--open` 换成 `EnvironmentFile=-/etc/lossless-web.env`，
+   并在该文件（0600）写 `LT_TOKEN=你的口令`。
+5. **访问密钥（`/etc/natfrp/config.json` 的 `token`）等于账号权限**：能建、能删隧道，别外传；它已是 0600。
+6. 免费节点**限速且共享**（实测约 1.8 MB/s）；长期大流量请用付费节点或自建 frps。
+7. 「开放模式 + 自动 HTTPS」这个组合下，删除操作**没有二次确认之外的任何保护**——页面上的删除按钮点下去就真的删了，且不进回收站（服务端是 `os.remove`）。
 
 ## 6. 验证公网连通性（按顺序）
 
