@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     HAS_PIL = False
 
-WEB_VERSION = "1.5.0"
+WEB_VERSION = "1.6.0"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
 # Never let an upload eat the last slice of the disk: a full root filesystem
@@ -83,6 +83,12 @@ MIN_FREE_BYTES = 512 * 1024 * 1024
 # Sentinel for _parse_range: a syntactically valid range that this file cannot
 # satisfy (416), as opposed to a header that should simply be ignored (200).
 _RANGE_UNSATISFIABLE = object()
+
+# Deleted files are moved here (inside the library, hidden from /api/list) and
+# swept after TRASH_DAYS. 15 days is the product decision; --trash-days 0 turns
+# the whole thing off and deletes immediately.
+TRASH_DAYS = 15
+TRASH_SWEEP_EVERY = 3600       # seconds between sweeps
 MAX_INIT_BODY = 64 << 20
 MAX_SMALL_BODY = 1 << 20
 PREVIEW_CHUNK = 1 << 20             # rolling read size for streamed responses
@@ -154,7 +160,8 @@ class HTTPError(Exception):
 class Config:
     def __init__(self, host: str, port: int, directory: str,
                  chunk_size: int, token: str,
-                 min_free_bytes: int = MIN_FREE_BYTES) -> None:
+                 min_free_bytes: int = MIN_FREE_BYTES,
+                 trash_days: int = TRASH_DAYS) -> None:
         self.host = host
         self.port = port
         self.dir = os.path.abspath(directory)
@@ -166,6 +173,9 @@ class Config:
         self.token = token
         # Floor of free space an upload may not eat into (0 = no check).
         self.min_free_bytes = min_free_bytes
+        # Deleted files land here instead of vanishing; swept after trash_days.
+        self.trash = os.path.join(self.dir, ".trash")
+        self.trash_days = trash_days
         self._locks: Dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
         # Preview renders are keyed by (name, size, mtime, width), so a lock per
@@ -244,6 +254,68 @@ def safe_name(name: Any) -> str:
     if any(name.endswith(s) for s in INTERNAL_SUFFIXES):
         raise HTTPError(400, "invalid file name (reserved internal suffix)")
     return name
+
+
+def move_to_trash(cfg: "Config", dest: str, name: str,
+                  now: Optional[float] = None) -> str:
+    """Move `dest` into .trash, keeping its bytes and marking the delete time.
+
+    The name is prefixed with the deletion epoch so two deletes of the same
+    filename never collide, and the mtime is reset to now - os.replace keeps
+    the ORIGINAL mtime, which would make a photo taken two years ago look like
+    it had been in the bin for two years and get swept on the next pass.
+    """
+    stamp = int(time.time() if now is None else now)
+    os.makedirs(cfg.trash, exist_ok=True)
+    target = os.path.join(cfg.trash, "%d-%s" % (stamp, name))
+    n = 1
+    while os.path.exists(target):
+        n += 1
+        target = os.path.join(cfg.trash, "%d-%d-%s" % (stamp, n, name))
+    os.replace(dest, target)
+    try:
+        ts = time.time() if now is None else now
+        os.utime(target, (ts, ts))
+    except OSError:
+        pass
+    return target
+
+
+def purge_trash(cfg: "Config", now: Optional[float] = None) -> int:
+    """Delete trash entries older than cfg.trash_days. Returns how many went."""
+    if cfg.trash_days <= 0:
+        return 0
+    cutoff = (time.time() if now is None else now) - cfg.trash_days * 86400
+    try:
+        entries = os.listdir(cfg.trash)
+    except FileNotFoundError:
+        return 0
+    removed = 0
+    for entry in entries:
+        path = os.path.join(cfg.trash, entry)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            continue          # a file locked by a reader simply waits a round
+    return removed
+
+
+def start_trash_sweeper(cfg: "Config") -> None:
+    """Sweep once at boot, then hourly, on a daemon thread."""
+    def loop() -> None:
+        while True:
+            try:
+                went = purge_trash(cfg)
+                if went:
+                    print("[trash] swept %d file(s) older than %d days"
+                          % (went, cfg.trash_days))
+            except Exception:
+                traceback.print_exc()
+            time.sleep(TRASH_SWEEP_EVERY)
+
+    threading.Thread(target=loop, name="trash-sweeper", daemon=True).start()
 
 
 def free_bytes(path: str) -> int:
@@ -756,6 +828,7 @@ class Handler(BaseHTTPRequestHandler):
             "version": WEB_VERSION,
             "protocol": lt.PROTOCOL_VERSION,
             "chunk_size": self.cfg.chunk_size,
+            "trash_days": self.cfg.trash_days,
             "token_required": bool(self.cfg.token),
             "tls": isinstance(self.server.socket, ssl.SSLSocket),
             # Header-less media elements (<video> posters/playback) append
@@ -1149,11 +1222,18 @@ class Handler(BaseHTTPRequestHandler):
         name = safe_name(body.get("name"))
         staging, key = self._staging_for(name)
         dest = os.path.join(self.cfg.dir, name)
+        trashed = False
         with self.cfg.lock_for(key):
             lt.cleanup_transfer_artifacts(staging)
             if os.path.isfile(dest):
-                os.remove(dest)
-        self._send_json({"ok": True, "name": name})
+                if self.cfg.trash_days > 0:
+                    # Recoverable by hand from <dir>/.trash until the sweep.
+                    move_to_trash(self.cfg, dest, name)
+                    trashed = True
+                else:
+                    os.remove(dest)
+        self._send_json({"ok": True, "name": name, "trashed": trashed,
+                         "trash_days": self.cfg.trash_days})
 
     # ---- framework ---------------------------------------------------------
     def do_GET(self) -> None:
@@ -1224,6 +1304,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "scripts/start_web.sh and scripts/start_web.ps1)")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
                    help="chunk size in bytes (default %d)" % DEFAULT_CHUNK_SIZE)
+    p.add_argument("--trash-days", type=int, default=TRASH_DAYS,
+                   help="deleted files are kept in <dir>/.trash for this many "
+                        "days before being purged (default %d, 0 = delete "
+                        "immediately)" % TRASH_DAYS)
     p.add_argument("--min-free-bytes", type=int, default=MIN_FREE_BYTES,
                    help="refuse an upload that would leave less free space than "
                         "this on the library filesystem (default %d, 0 disables)"
@@ -1275,7 +1359,8 @@ def main(argv: Optional[list] = None) -> int:
     else:
         token = args.token or _env("LT_TOKEN", "") or secrets.token_urlsafe(18)
     cfg = Config(args.host, args.port, args.dir, args.chunk_size, token,
-                 min_free_bytes=max(0, args.min_free_bytes))
+                 min_free_bytes=max(0, args.min_free_bytes),
+                 trash_days=max(0, args.trash_days))
     cfg.ensure_dirs()
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
@@ -1284,6 +1369,8 @@ def main(argv: Optional[list] = None) -> int:
     # also honours `?t=<token>` - one expiring, tunnel-scoped secret, never
     # part of a verified download. See Handler._require_auth.
     httpd.media_token = secrets.token_urlsafe(9)  # type: ignore[attr-defined]
+    if cfg.trash_days > 0:
+        start_trash_sweeper(cfg)
     tls = False
     if args.tls_cert:
         try:

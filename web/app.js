@@ -34,6 +34,7 @@
   var serverChunk = 0;
   var mediaToken = '';      // header-less media use this instead of X-LT-Token
   var serverPil = false;    // /api/image can render display copies server-side
+  var trashDays = 15;       // server keeps deleted files this long (0 = off)
   var busy = false;
 
   // ---- logging ------------------------------------------------------------
@@ -136,6 +137,7 @@
       mediaToken = info.media_token || '';
       tokenRequired = info.token_required !== false;
       serverPil = info.preview_pipeline === true;
+      if (typeof info.trash_days === 'number') trashDays = info.trash_days;
     } catch (e) {
       // 401 means the server does require a token: show the input and stop.
       if (e.status === 401) {
@@ -1232,18 +1234,22 @@
   }
 
   async function deleteFile(name) {
-    if (!confirm('确定删除服务端文件「' + name + '」？')) return;
+    var ask = trashDays > 0
+      ? '确定删除服务端文件「' + name + '」？\n\n会先移入回收站，' + trashDays + ' 天后自动清理。'
+      : '确定删除服务端文件「' + name + '」？此操作不可恢复。';
+    if (!confirm(ask)) return;
     if (lb.state.open && lb.state.name === name) closeLightbox();
     // The element (and its object URL) is about to go away with the refresh.
     var card = cards[name];
     if (card && card.thumbUrl) { URL.revokeObjectURL(card.thumbUrl); card.thumbUrl = null; }
     try {
-      await api('/api/delete', {
+      var r = await api('/api/delete', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: name })
       });
-      log('已删除 ' + name, 'warn');
+      log((r.body && r.body.trashed ? '已移入回收站 ' : '已删除 ') + name +
+          (r.body && r.body.trashed ? '（' + trashDays + ' 天后自动清理）' : ''), 'warn');
       delete selected[name];
       await refresh();
     } catch (e) {

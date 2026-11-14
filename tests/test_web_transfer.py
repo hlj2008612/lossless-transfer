@@ -35,6 +35,7 @@ import ssl
 import struct
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
@@ -523,6 +524,36 @@ class WebTransferE2E(unittest.TestCase):
             os.remove(noexif_path)
 
 
+    # ---- the recycle bin (.trash) -----------------------------------------
+    def test_21_delete_moves_the_file_into_trash(self):
+        data = sample_bytes(120, seed=31)
+        m = browser_manifest("bin-me.jpg", data)
+        self.upload_all(m, data)
+        st, _, body = self.req_json("POST", "/api/delete", {"name": "bin-me.jpg"})
+        self.assertEqual(st, 200)
+        self.assertTrue(json.loads(body)["trashed"])
+        self.assertNotIn("bin-me.jpg", os.listdir(self.lib),
+                         "the file must be gone from the library")
+        trash = os.path.join(self.lib, ".trash")
+        entries = [e for e in os.listdir(trash) if e.endswith("bin-me.jpg")]
+        self.assertEqual(len(entries), 1, entries)
+        with open(os.path.join(trash, entries[0]), "rb") as f:
+            self.assertEqual(f.read(), data, "trashed bytes must be intact")
+        # and it must not show up in the listing
+        st2, _, listing = self.req("GET", "/api/list")
+        self.assertNotIn(b"bin-me.jpg", listing)
+
+    def test_21b_same_name_deleted_twice_keeps_both_copies(self):
+        data = sample_bytes(80, seed=32)
+        for _ in range(2):
+            m = browser_manifest("twice.jpg", data)
+            self.upload_all(m, data)
+            st, _, _ = self.req_json("POST", "/api/delete", {"name": "twice.jpg"})
+            self.assertEqual(st, 200)
+        trash = os.path.join(self.lib, ".trash")
+        entries = [e for e in os.listdir(trash) if e.endswith("twice.jpg")]
+        self.assertEqual(len(entries), 2, "a second delete must not overwrite the first")
+
     # ---- Range handling: the whole of <video> seeking lives here ----------
     def _put(self, name: str, data: bytes) -> None:
         with open(os.path.join(self.lib, name), "wb") as f:
@@ -902,3 +933,54 @@ class DiskReserve(unittest.TestCase):
             self.assertEqual(status, 200, payload[:300])
         finally:
             self.cfg.min_free_bytes = 1 << 60
+
+
+class TrashPolicy(unittest.TestCase):
+    """The 15-day retention rule, tested on the helpers themselves."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="lt-trash-")
+        self.lib = os.path.join(self.tmp, "shared")
+        self.cfg = wt.Config("127.0.0.1", 0, self.lib, CHUNK_SIZE, "",
+                             trash_days=15)
+        self.cfg.ensure_dirs()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _dropped(self, name: str, now: float) -> str:
+        path = os.path.join(self.lib, name)
+        with open(path, "wb") as f:
+            f.write(b"payload")
+        return wt.move_to_trash(self.cfg, path, name, now=now)
+
+    def test_22_age_is_counted_from_the_delete_not_the_photo(self):
+        # os.replace keeps the source mtime; if the trash entry kept the
+        # original date, an old photo would be swept on the next pass.
+        old = 1_600_000_000.0
+        path = os.path.join(self.lib, "old.jpg")
+        with open(path, "wb") as f:
+            f.write(b"x")
+        os.utime(path, (old, old))
+        now = 1_790_000_000.0
+        target = wt.move_to_trash(self.cfg, path, "old.jpg", now=now)
+        self.assertAlmostEqual(os.path.getmtime(target), now, delta=2)
+
+    def test_23_purge_respects_the_15_day_window(self):
+        now = 1_790_000_000.0
+        self._dropped("fresh.jpg", now)
+        self.assertEqual(wt.purge_trash(self.cfg, now=now + 14 * 86400), 0,
+                         "14 days old must survive")
+        self.assertEqual(wt.purge_trash(self.cfg, now=now + 16 * 86400), 1,
+                         "16 days old must be purged")
+        self.assertEqual(os.listdir(self.cfg.trash), [])
+
+    def test_24_zero_days_disables_the_bin(self):
+        self.cfg.trash_days = 0
+        path = os.path.join(self.lib, "now.jpg")
+        with open(path, "wb") as f:
+            f.write(b"x")
+        self.assertEqual(wt.purge_trash(self.cfg, now=time.time() + 10 ** 9), 0)
+        # move_to_trash is never called in that mode (see _api_delete), so the
+        # bin directory stays absent.
+        self.assertFalse(os.path.isdir(self.cfg.trash))
