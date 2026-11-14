@@ -93,6 +93,8 @@
 │   └── fixtures/                   # 公开的一次性测试用自签证书（非真实凭据）
 │       ├── test_cert.pem
 │       └── test_key.pem
+├── deploy/
+│   └── lossless-web.service        # systemd 常驻单元（Linux）
 └── scripts/
     ├── verify_transfer.py          # 独立校验脚本：真实 CLI 双进程，出 38/38 报告
     ├── gen_cert.sh                 # 零依赖自签证书生成器（Linux / macOS，只需 openssl）
@@ -214,19 +216,31 @@ Linux / macOS 特有的注意点：
 - **监听地址与防火墙**：脚本默认 `--host 127.0.0.1`（配合隧道）。要让同网段其它机器直连，启动时加 `--host 0.0.0.0`（Windows 侧对应 `-Bind 0.0.0.0`），并放行端口：`sudo ufw allow 8765/tcp`。绑定 `0.0.0.0` 等于把「上传/下载/删除」能力交给整个局域网，只在内网可信时使用。
 - **开机自启（可选）**：`.sh` 是前台进程，需要常驻时用 systemd：
 
+仓库里已带一份可直接用的 unit：`deploy/lossless-web.service`（`User=mq`、`WorkingDirectory=/home/mq/lossless-transfer`，按你的路径改这两处即可）。
+
+```bash
+sudo install -m 644 deploy/lossless-web.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now lossless-web
+systemctl status lossless-web --no-pager
+journalctl -u lossless-web -f          # ACCESS TOKEN 与访问日志
+```
+
 ```ini
-# /etc/systemd/system/lossless-web.service
 [Unit]
-Description=lossless-transfer web
-After=network.target
+Description=lossless-transfer web (photo/video transfer, byte-exact)
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=mqm
-WorkingDirectory=/home/mqm/lossless-transfer
+User=mq
+Group=mq
+WorkingDirectory=/home/mq/lossless-transfer
 Environment=PYTHON_EXE=/usr/bin/python3
-ExecStart=/home/mqm/lossless-transfer/scripts/start_web.sh --open --dir shared
+ExecStart=/home/mq/lossless-transfer/scripts/start_web.sh --behind-tls --open --dir shared --host 0.0.0.0 --port 8765
 Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

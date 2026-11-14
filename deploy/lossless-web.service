@@ -1,0 +1,23 @@
+[Unit]
+Description=lossless-transfer web (photo/video transfer, byte-exact)
+Documentation=https://github.com/hlj2008612/lossless-transfer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mq
+Group=mq
+WorkingDirectory=/home/mq/lossless-transfer
+# Keeps the launcher's behaviour: generate tls/ if missing, pick the
+# interpreter, then exec web_transfer.py in the foreground (systemd is the
+# supervisor here, so no extra backgrounding).
+Environment=PYTHON_EXE=/usr/bin/python3
+ExecStart=/home/mq/lossless-transfer/scripts/start_web.sh --behind-tls --open --dir shared --host 0.0.0.0 --port 8765
+Restart=on-failure
+RestartSec=3
+# A transfer is a long-lived socket; do not let a slow LAN packet kill it.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
