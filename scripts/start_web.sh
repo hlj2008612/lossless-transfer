@@ -25,6 +25,7 @@
 set -euo pipefail
 
 PORT=8765
+HOST='127.0.0.1'
 DIR='shared'
 TOKEN=''
 OPEN=0
@@ -39,6 +40,9 @@ usage() {
 start_web.sh - launch the lossless-transfer web server
 
   --port N            listen port                       (default: 8765)
+  --host ADDR         bind address                      (default: 127.0.0.1)
+                      127.0.0.1 = this machine / a local tunnel only
+                      0.0.0.0   = reachable from the LAN (open the firewall)
   --dir PATH          library folder                    (default: shared)
   --token SECRET      fixed access token                (default: random)
   --open              no token at all (anyone can upload/download/DELETE)
@@ -56,10 +60,11 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --port|--dir|--token|--dns|--chunk-size|--days)
+    --port|--host|--dir|--token|--dns|--chunk-size|--days)
       [ $# -ge 2 ] || { echo "start_web.sh: $1 needs a value" >&2; exit 2; }
       case "$1" in
         --port)       PORT="$2" ;;
+        --host)       HOST="$2" ;;
         --dir)        DIR="$2" ;;
         --token)      TOKEN="$2" ;;
         --dns)        DNS_NAMES="$2" ;;
@@ -102,7 +107,7 @@ fi
 
 # 2. Build the web_transfer.py argument list.
 ARGS=("$ROOT/web_transfer.py"
-      --host 127.0.0.1
+      --host "$HOST"
       --port "$PORT"
       --dir "$ROOT/$DIR"
       --chunk-size "$CHUNK")
@@ -125,11 +130,11 @@ fi
 printf '    %s %s\n' "$PYTHON" "${ARGS[*]}"
 echo
 if [ "$BEHIND_TLS" -eq 1 ]; then
-  echo "    Point the HTTP tunnel / reverse proxy at 127.0.0.1:$PORT"
+  echo "    Point the HTTP tunnel / reverse proxy at $HOST:$PORT"
   echo '    (SakuraFrp: tunnel type HTTP, "Auto HTTPS" ENABLED).'
   echo '    Browser: https://<your domain> - certificate comes from the proxy, no warnings.'
 else
-  echo "    SakuraFrp TCP tunnel: local 127.0.0.1:$PORT , Auto HTTPS = DISABLED"
+  echo "    SakuraFrp TCP tunnel: local $HOST:$PORT , Auto HTTPS = DISABLED"
   echo '    Browser (other network): https://<public host> (accept the self-signed cert once)'
 fi
 if [ "$OPEN" -eq 1 ]; then

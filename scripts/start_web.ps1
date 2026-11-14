@@ -24,6 +24,7 @@
   pwsh -NoProfile -File .\scripts\start_web.ps1
   .\scripts\start_web.ps1 -Token 'my-long-random-secret' -RegenerateCert
   .\scripts\start_web.ps1 -DnsNames localhost,127.0.0.1,my-tunnel.example.com
+  .\scripts\start_web.ps1 -Bind 0.0.0.0 -Port 8765   # reachable from the LAN
 
 .NOTES
   Alternative with no certificate at all: enable the launcher's "Auto HTTPS"
@@ -32,6 +33,11 @@
 [CmdletBinding()]
 param(
     [int]      $Port           = 8765,
+    # Bind address: 127.0.0.1 = this machine / a local tunnel only,
+    # 0.0.0.0 = reachable from the LAN (open the firewall too).
+    # Named -Bind because $Host is a read-only automatic variable and cannot
+    # be used as a parameter name.
+    [string]   $Bind           = '127.0.0.1',
     # The folder the page calls 资料库. 'shared' is the web library (it is what
     # the tunnel exposes and what README documents); the CLI receiver writes to
     # 'received' instead, so the two never mix by accident.
@@ -76,7 +82,7 @@ if ($BehindTls) {
 
 # 2. Build the web_transfer.py argument list.
 $pyArgs = @('-3', (Join-Path $root 'web_transfer.py'),
-            '--host', '127.0.0.1',
+            '--host', $Bind,
             '--port', [string]$Port,
             '--dir', (Join-Path $root $Dir),
             '--chunk-size', [string]$ChunkSize)
