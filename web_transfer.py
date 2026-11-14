@@ -89,6 +89,11 @@ _RANGE_UNSATISFIABLE = object()
 # the whole thing off and deletes immediately.
 TRASH_DAYS = 15
 TRASH_SWEEP_EVERY = 3600       # seconds between sweeps
+# An upload that is init'ed but never finished leaves a 0-byte .part and a
+# state file behind. On an open endpoint that is a cheap way to litter the
+# inode table, so the same background sweep drops staging pairs untouched for
+# a day (an active upload refreshes its state file on every chunk).
+STAGING_TTL = 24 * 3600
 MAX_INIT_BODY = 64 << 20
 MAX_SMALL_BODY = 1 << 20
 PREVIEW_CHUNK = 1 << 20             # rolling read size for streamed responses
@@ -302,6 +307,31 @@ def purge_trash(cfg: "Config", now: Optional[float] = None) -> int:
     return removed
 
 
+def purge_staging(cfg: "Config", now: Optional[float] = None) -> int:
+    """Drop abandoned upload staging pairs older than STAGING_TTL."""
+    cutoff = (time.time() if now is None else now) - STAGING_TTL
+    try:
+        entries = os.listdir(cfg.staging)
+    except FileNotFoundError:
+        return 0
+    removed = 0
+    for entry in entries:
+        if not entry.endswith(lt.STATE_SUFFIX):
+            continue
+        state_path = os.path.join(cfg.staging, entry)
+        try:
+            if os.path.getmtime(state_path) >= cutoff:
+                continue          # still being written, or just started
+            os.remove(state_path)
+            part = state_path[:-len(lt.STATE_SUFFIX)] + ".part"
+            if os.path.isfile(part):
+                os.remove(part)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def start_trash_sweeper(cfg: "Config") -> None:
     """Sweep once at boot, then hourly, on a daemon thread."""
     def loop() -> None:
@@ -311,6 +341,9 @@ def start_trash_sweeper(cfg: "Config") -> None:
                 if went:
                     print("[trash] swept %d file(s) older than %d days"
                           % (went, cfg.trash_days))
+                stale = purge_staging(cfg)
+                if stale:
+                    print("[staging] dropped %d abandoned upload(s)" % stale)
             except Exception:
                 traceback.print_exc()
             time.sleep(TRASH_SWEEP_EVERY)

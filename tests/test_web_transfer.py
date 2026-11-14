@@ -984,3 +984,36 @@ class TrashPolicy(unittest.TestCase):
         # move_to_trash is never called in that mode (see _api_delete), so the
         # bin directory stays absent.
         self.assertFalse(os.path.isdir(self.cfg.trash))
+
+
+class StagingSweep(unittest.TestCase):
+    """An init that never finishes must not live forever."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="lt-staging-")
+        self.cfg = wt.Config("127.0.0.1", 0, os.path.join(self.tmp, "shared"),
+                             CHUNK_SIZE, "")
+        self.cfg.ensure_dirs()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pair(self, name: str, age_sec: float) -> None:
+        staging = os.path.join(self.cfg.staging, name)
+        state = staging + wt.lt.STATE_SUFFIX
+        with open(state, "w", encoding="utf-8") as f:
+            f.write("{}")
+        with open(staging + ".part", "wb"):
+            pass
+        old = time.time() - age_sec
+        os.utime(state, (old, old))
+
+    def test_25_only_stale_pairs_are_dropped(self):
+        self._pair("abandoned", age_sec=25 * 3600)
+        self._pair("active", age_sec=60)
+        self.assertEqual(wt.purge_staging(self.cfg), 1)
+        left = sorted(os.listdir(self.cfg.staging))
+        self.assertFalse([e for e in left if e.startswith("abandoned")],
+                         "the abandoned pair must be gone: %s" % left)
+        self.assertIn("active" + wt.lt.STATE_SUFFIX, left)
+        self.assertIn("active.part", left)
