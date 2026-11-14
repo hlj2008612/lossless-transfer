@@ -71,7 +71,7 @@ except Exception:  # pragma: no cover
     Image = None  # type: ignore[assignment]
     HAS_PIL = False
 
-WEB_VERSION = "1.6.0"
+WEB_VERSION = "1.6.1"
 DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB; fewer round-trips over a tunnel
 MAX_CHUNKS = 100_000
 # Never let an upload eat the last slice of the disk: a full root filesystem
@@ -92,8 +92,9 @@ TRASH_SWEEP_EVERY = 3600       # seconds between sweeps
 # An upload that is init'ed but never finished leaves a 0-byte .part and a
 # state file behind. On an open endpoint that is a cheap way to litter the
 # inode table, so the same background sweep drops staging pairs untouched for
-# a day (an active upload refreshes its state file on every chunk).
-STAGING_TTL = 24 * 3600
+# three days (an active upload refreshes its state file on every chunk, so a
+# shorter window would surprise anyone who pauses over a weekend).
+STAGING_TTL = 72 * 3600
 MAX_INIT_BODY = 64 << 20
 MAX_SMALL_BODY = 1 << 20
 PREVIEW_CHUNK = 1 << 20             # rolling read size for streamed responses
@@ -307,6 +308,39 @@ def purge_trash(cfg: "Config", now: Optional[float] = None) -> int:
     return removed
 
 
+def reclaim_trash(cfg: "Config", need_bytes: int) -> int:
+    """Free `need_bytes` by dropping the OLDEST trash entries first.
+
+    Kept separate from purge_trash so a full disk can be rescued without
+    shortening the retention rule: the bin is a courtesy, the ability to
+    upload is the product.
+    """
+    if cfg.trash_days <= 0 or need_bytes <= 0:
+        return 0
+    try:
+        entries = []
+        for entry in os.listdir(cfg.trash):
+            path = os.path.join(cfg.trash, entry)
+            if os.path.isfile(path):
+                entries.append((os.path.getmtime(path), path,
+                                os.path.getsize(path)))
+    except FileNotFoundError:
+        return 0
+    entries.sort()                       # oldest deletion first
+    freed = 0
+    removed = 0
+    for _, path, size in entries:
+        if freed >= need_bytes:
+            break
+        try:
+            os.remove(path)
+            freed += size
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def purge_staging(cfg: "Config", now: Optional[float] = None) -> int:
     """Drop abandoned upload staging pairs older than STAGING_TTL."""
     cutoff = (time.time() if now is None else now) - STAGING_TTL
@@ -332,8 +366,14 @@ def purge_staging(cfg: "Config", now: Optional[float] = None) -> int:
     return removed
 
 
-def start_trash_sweeper(cfg: "Config") -> None:
-    """Sweep once at boot, then hourly, on a daemon thread."""
+def start_janitor(cfg: "Config") -> None:
+    """Sweep once at boot, then hourly, on a daemon thread.
+
+    Two unrelated duties live here on purpose (one thread, one wake-up): the
+    trash retention rule and abandoned-upload staging. They must NOT share a
+    switch - purge_trash already returns 0 when --trash-days is 0, so the
+    caller starts this unconditionally.
+    """
     def loop() -> None:
         while True:
             try:
@@ -348,7 +388,7 @@ def start_trash_sweeper(cfg: "Config") -> None:
                 traceback.print_exc()
             time.sleep(TRASH_SWEEP_EVERY)
 
-    threading.Thread(target=loop, name="trash-sweeper", daemon=True).start()
+    threading.Thread(target=loop, name="janitor", daemon=True).start()
 
 
 def free_bytes(path: str) -> int:
@@ -926,10 +966,16 @@ class Handler(BaseHTTPRequestHandler):
                 if os.path.isfile(part0):
                     need = max(0, need - os.path.getsize(part0))
                 avail = free_bytes(self.cfg.dir)
+                deficit = need + self.cfg.min_free_bytes - avail
+                if deficit > 0 and need:
+                    # Space is short: the oldest deletions go first, so the
+                    # bin never blocks a legitimate upload.
+                    if reclaim_trash(self.cfg, deficit):
+                        avail = free_bytes(self.cfg.dir)
                 if need and avail - need < self.cfg.min_free_bytes:
                     raise HTTPError(
-                        507, "not enough disk space: %d MiB free, this upload "
-                             "needs %d MiB and %d MiB must stay free"
+                        507, "磁盘空间不足：剩余 %d MiB，本次需要 %d MiB，"
+                             "且必须保留 %d MiB"
                              % (avail >> 20, need >> 20,
                                 self.cfg.min_free_bytes >> 20))
             next_index = lt.load_resume_state(staging, v)
@@ -1053,9 +1099,14 @@ class Handler(BaseHTTPRequestHandler):
             raise HTTPError(400, "chunk index out of range")
         offset = index * cs
         length = min(cs, size - offset)
-        with open(dest, "rb") as f:
-            f.seek(offset)
-            data = f.read(length)
+        try:
+            with open(dest, "rb") as f:
+                f.seek(offset)
+                data = f.read(length)
+        except FileNotFoundError:
+            # Deleted between the stat above and this open: a client asking
+            # for a file that is gone deserves 404, not a stack trace.
+            raise HTTPError(404, "file was deleted during the download")
         self._send_bytes(data, "application/octet-stream", 200, {
             "X-Chunk-Index": str(index),
             "X-Chunk-Sha256": hashlib.sha256(data).hexdigest(),
@@ -1258,13 +1309,17 @@ class Handler(BaseHTTPRequestHandler):
         trashed = False
         with self.cfg.lock_for(key):
             lt.cleanup_transfer_artifacts(staging)
-            if os.path.isfile(dest):
-                if self.cfg.trash_days > 0:
-                    # Recoverable by hand from <dir>/.trash until the sweep.
-                    move_to_trash(self.cfg, dest, name)
-                    trashed = True
-                else:
-                    os.remove(dest)
+            if not os.path.isfile(dest):
+                # Not idempotent on purpose: with several people on the same
+                # folder, reporting success for a file that is already gone
+                # tells the user their click did something it did not.
+                raise HTTPError(404, "file not found (already deleted?)")
+            if self.cfg.trash_days > 0:
+                # Recoverable by hand from <dir>/.trash until the sweep.
+                move_to_trash(self.cfg, dest, name)
+                trashed = True
+            else:
+                os.remove(dest)
         self._send_json({"ok": True, "name": name, "trashed": trashed,
                          "trash_days": self.cfg.trash_days})
 
@@ -1293,7 +1348,7 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self.close_connection = True
             try:
-                self._send_json({"error": "internal error: %s" % exc}, 500)
+                self._send_json({"error": "internal error"}, 500)
             except Exception:
                 pass
 
@@ -1402,8 +1457,7 @@ def main(argv: Optional[list] = None) -> int:
     # also honours `?t=<token>` - one expiring, tunnel-scoped secret, never
     # part of a verified download. See Handler._require_auth.
     httpd.media_token = secrets.token_urlsafe(9)  # type: ignore[attr-defined]
-    if cfg.trash_days > 0:
-        start_trash_sweeper(cfg)
+    start_janitor(cfg)
     tls = False
     if args.tls_cert:
         try:

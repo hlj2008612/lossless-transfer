@@ -554,6 +554,31 @@ class WebTransferE2E(unittest.TestCase):
         entries = [e for e in os.listdir(trash) if e.endswith("twice.jpg")]
         self.assertEqual(len(entries), 2, "a second delete must not overwrite the first")
 
+    def test_21c_deleting_a_missing_file_is_404(self):
+        st, _, body = self.req_json("POST", "/api/delete", {"name": "never-existed.jpg"})
+        self.assertEqual(st, 404, body[:200])
+        self.assertIn(b"not found", body)
+
+    def test_21d_chunk_vanishing_mid_request_is_404_not_500(self):
+        # Simulates the delete landing between the stat and the open: the
+        # client must see 404 (file gone), never a 500 with a stack trace.
+        data = sample_bytes(90, seed=33)
+        self._put("vanishing.jpg", data)
+        real = os.path.getsize
+
+        def racing_getsize(path, _real=real):
+            size = _real(path)
+            os.remove(path)          # the file disappears right after the stat
+            return size
+
+        from unittest import mock
+        with mock.patch.object(wt.os.path, "getsize", racing_getsize):
+            st, _, body = self.req("GET",
+                                   "/api/download/chunk?name=vanishing.jpg&index=0")
+        self.assertEqual(st, 404, body[:200])
+        self.assertNotIn(b"/home", body)
+        self.assertNotIn(b"Traceback", body)
+
     # ---- Range handling: the whole of <video> seeking lives here ----------
     def _put(self, name: str, data: bytes) -> None:
         with open(os.path.join(self.lib, name), "wb") as f:
@@ -915,7 +940,7 @@ class DiskReserve(unittest.TestCase):
         status = resp.status
         conn.close()
         self.assertEqual(status, 507, payload[:300])
-        self.assertIn(b"disk space", payload)
+        self.assertIn("磁盘空间不足".encode("utf-8"), payload)
 
     def test_20b_reserve_of_zero_disables_the_check(self):
         self.cfg.min_free_bytes = 0
@@ -1009,7 +1034,7 @@ class StagingSweep(unittest.TestCase):
         os.utime(state, (old, old))
 
     def test_25_only_stale_pairs_are_dropped(self):
-        self._pair("abandoned", age_sec=25 * 3600)
+        self._pair("abandoned", age_sec=80 * 3600)
         self._pair("active", age_sec=60)
         self.assertEqual(wt.purge_staging(self.cfg), 1)
         left = sorted(os.listdir(self.cfg.staging))
@@ -1017,3 +1042,41 @@ class StagingSweep(unittest.TestCase):
                          "the abandoned pair must be gone: %s" % left)
         self.assertIn("active" + wt.lt.STATE_SUFFIX, left)
         self.assertIn("active.part", left)
+
+
+class TrashReclaim(unittest.TestCase):
+    """A full disk must be rescued before it blocks a legitimate upload."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="lt-reclaim-")
+        self.cfg = wt.Config("127.0.0.1", 0, os.path.join(self.tmp, "shared"),
+                             CHUNK_SIZE, "", trash_days=15)
+        self.cfg.ensure_dirs()
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _entry(self, name: str, size: int, age_sec: float) -> None:
+        path = os.path.join(self.cfg.trash, name)
+        os.makedirs(self.cfg.trash, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"x" * size)
+        stamp = time.time() - age_sec
+        os.utime(path, (stamp, stamp))
+
+    def test_26_oldest_entries_go_first(self):
+        self._entry("oldest.jpg", 100, 10 * 86400)
+        self._entry("middle.jpg", 100, 5 * 86400)
+        self._entry("newest.jpg", 100, 60)
+        # 150 bytes are needed: the two oldest (200 B) cover it, newest stays.
+        self.assertEqual(wt.reclaim_trash(self.cfg, 150), 2)
+        left = os.listdir(self.cfg.trash)
+        self.assertEqual(left, ["newest.jpg"])
+
+    def test_27_nothing_to_reclaim_leaves_the_bin_alone(self):
+        self._entry("only.jpg", 10, 86400)
+        self.assertEqual(wt.reclaim_trash(self.cfg, 0), 0)
+        self.assertEqual(os.listdir(self.cfg.trash), ["only.jpg"])
+        self.cfg.trash_days = 0
+        self.assertEqual(wt.reclaim_trash(self.cfg, 10 ** 6), 0)
+        self.assertEqual(os.listdir(self.cfg.trash), ["only.jpg"])

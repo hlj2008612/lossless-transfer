@@ -1253,6 +1253,13 @@
       delete selected[name];
       await refresh();
     } catch (e) {
+      if (e.status === 404) {
+        // Someone else (another tab, another person) got there first.
+        log('文件已不存在，可能已被其他人删除：' + name, 'warn');
+        delete selected[name];
+        await refresh();
+        return;
+      }
       log('删除失败：' + e.message, 'err');
     }
   }
