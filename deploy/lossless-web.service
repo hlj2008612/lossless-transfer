@@ -13,7 +13,13 @@ WorkingDirectory=/home/mq/lossless-transfer
 # interpreter, then exec web_transfer.py in the foreground (systemd is the
 # supervisor here, so no extra backgrounding).
 Environment=PYTHON_EXE=/usr/bin/python3
-ExecStart=/home/mq/lossless-transfer/scripts/start_web.sh --behind-tls --open --dir shared --host 0.0.0.0 --port 8765
+# The access token lives here (mode 0600, root), never in this file: `systemctl
+# cat` and unit dumps must not print the secret.
+EnvironmentFile=-/etc/lossless-web.env
+# 127.0.0.1 is deliberate. A tunnel (frpc on this box) or a reverse proxy is the
+# only intended entry point; 0.0.0.0 would hand upload/download/DELETE to the
+# whole LAN as well.
+ExecStart=/home/mq/lossless-transfer/scripts/start_web.sh --behind-tls --dir shared --host 127.0.0.1 --port 8765
 Restart=on-failure
 RestartSec=3
 # A transfer is a long-lived socket; do not let a slow LAN packet kill it.

@@ -1,0 +1,22 @@
+[Unit]
+Description=SakuraFrp tunnel for lossless-transfer
+Documentation=https://doc.natfrp.com/
+# The web service must be up before the tunnel points at it, and the node
+# connection needs a working route (not just a link).
+After=network-online.target lossless-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lossless-frp
+# frpc exits when the node drops it or the tunnel is deleted; keep retrying so
+# a node migration does not silently take the public entry offline.
+Restart=always
+RestartSec=5
+# Never run this as the login user: it only needs the frpc binary and the two
+# config files, and both live under /etc with root-only access.
+User=root
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
