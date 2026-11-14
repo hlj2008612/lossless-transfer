@@ -12,7 +12,7 @@
 #
 # Usage:
 #   ./scripts/gen_cert.sh                                  # ./cert.pem + ./key.pem
-#   ./scripts/gen_cert.sh --out-dir ./tls --dns localhost,127.0.0.1,frp-ski.com
+#   ./scripts/gen_cert.sh --out-dir ./tls --dns localhost,127.0.0.1,www.example.nyat.app
 #   ./scripts/gen_cert.sh --out-dir ./tls --days 365 --force
 # ---------------------------------------------------------------------------
 set -euo pipefail

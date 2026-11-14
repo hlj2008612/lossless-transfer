@@ -18,7 +18,7 @@
   No OpenSSL, no Python packages, no internet access, no admin rights.
 
 .EXAMPLE
-  pwsh -File .\scripts\gen_cert.ps1 -OutDir .\tls -DnsNames localhost,127.0.0.1,frp-ski.com
+  pwsh -File .\scripts\gen_cert.ps1 -OutDir .\tls -DnsNames localhost,127.0.0.1,www.example.nyat.app
   py -3 web_transfer.py --dir .\received --tls-cert .\tls\cert.pem --tls-key .\tls\key.pem
 
 .NOTES

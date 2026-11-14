@@ -31,7 +31,10 @@ TOKEN=''
 OPEN=0
 BEHIND_TLS=0
 REGEN=0
-DNS_NAMES='localhost,127.0.0.1,frp-ski.com,dx.frp-ski.com,yd.frp-ski.com'
+# Only used when this launcher has to mint a self-signed cert. SakuraFrp's
+# own subdomain binding issues a real cert instead (no warning at all), so
+# keep this minimal and add your tunnel hostname only if you self-sign.
+DNS_NAMES='localhost,127.0.0.1'
 CHUNK=4194304
 DAYS=365
 

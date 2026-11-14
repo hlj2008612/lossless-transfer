@@ -45,8 +45,10 @@ param(
     [string]   $Token          = '',
     # Open mode: no token. Anyone who reaches the URL can upload/download/delete.
     [switch]   $Open,
-    [string[]] $DnsNames       = @('localhost', '127.0.0.1', 'frp-ski.com',
-                                    'dx.frp-ski.com', 'yd.frp-ski.com'),
+    # Only used when this launcher mints a self-signed cert; SakuraFrp's subdomain
+    # binding issues a real one, so keep this minimal and add your hostname only
+    # if you actually self-sign.
+    [string[]] $DnsNames       = @('localhost', '127.0.0.1'),
     [int]      $ChunkSize      = 4194304,
     [ValidateRange(1, 3650)]
     [int]      $Days           = 365,

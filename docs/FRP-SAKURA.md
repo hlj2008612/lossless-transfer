@@ -79,7 +79,7 @@ sudo ufw delete allow 8765/tcp
    - 面板给隧道设「访问密码」（HTTP 隧道支持，浏览器先弹一次 Basic Auth）；
    - 用完就 `sudo systemctl stop lossless-frp`，入口立即消失，本机服务不受影响；
    - 换回令牌模式（见第 4 条）。
-3. **TLS 由节点终止**：节点用自己的自签证书（`CN=SakuraFrp Automatic TLS`，SAN 仅 `dx.frp-ski.com`），所以公网段是加密的，但**证书不代表身份**——浏览器那一次告警是正常的，别在公共网络上凭地址判断真伪。
+3. **TLS 由节点终止**：未做子域绑定时，节点使用自签的节点证书（`CN=SakuraFrp Automatic TLS`），公网段虽然加密，但**证书不代表身份**，浏览器会告警一次。完成「子域绑定」后，节点改用 ZeroSSL 等公共 CA 签发的证书（见 README「公网访问」），告警消失，此时证书才真正说明身份。
 4. **随时可以恢复令牌**（改一行 unit 即可，不动代码）：
    ```bash
    sudo sed -i 's|--open|--token 你的口令|' /etc/systemd/system/lossless-web.service
