@@ -115,6 +115,12 @@ curl -H "X-LT-Token: 你的令牌" -o /tmp/t.jpg -w "%{speed_download} B/s\n" \
 | 501 | 明文 HTTP 被内地节点拦截 | 开自动 HTTPS，或改 TCP 隧道 + 本机 HTTPS |
 | 一直 401 | 没带令牌或令牌没生效 | `curl -H "X-LT-Token: ..."`；核对 `/etc/lossless-web.env` |
 | 证书告警 | HTTP 隧道却让本机也开了 TLS | 去掉 `--behind-tls` 与本机证书，二选一 |
+| `https` 入口 502，响应头 `Server: natfrp-autohttps`，正文是 `read tcp 127.0.0.1:x->127.0.0.1:8765: read: connection reset by peer` | **节点已代理 TLS**（把 TLS 终止在节点，再以明文回源），本机却又开了 HTTPS，回源握手失败 | 本机改回明文：`ExecStart` 带 `--behind-tls`，并删掉 `tls/` 证书 |
+| `http` 入口 501（页面标题 `501 Not Implemented`） | 明文 HTTP 直接被节点拦截（合规） | 改用 `https://` 入口；若节点没有自动 HTTPS，就自建证书或换节点 |
+
+> 判断依据很简单：**谁终止 TLS，另一端就只能是明文**。
+> - 节点终止（`natfrp-autohttps` / 面板"自动 HTTPS"）→ 本机 `--behind-tls`
+> - 本机终止（TCP 隧道 + `tls/cert.pem`）→ 面板不要开自动 HTTPS，入口用 `https://域名:端口` 并接受一次自签证书
 
 ## 7. 客户端参数速查
 
